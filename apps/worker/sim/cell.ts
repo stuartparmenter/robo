@@ -224,7 +224,7 @@ export function cellFixture(cell: CellGeometry) {
         .join("")}
     </body>
     <body name="stop" pos="${loadX} ${loadY + stopPos} .0065">
-      <joint name="stop_slide" type="slide" axis="0 1 0" range="${stopRange.min + stopHalfDepth - stopPos} ${stopRange.max + stopHalfDepth - stopPos}" damping="4" frictionloss="60" armature=".02"/>
+      <joint name="stop_slide" type="slide" axis="0 1 0" range="${stopRange.min + stopHalfDepth - stopPos} ${stopRange.max + stopHalfDepth - stopPos}" damping="4" frictionloss=".3" armature=".02"/>
       ${box(".019 .004 .008", "0 0 .008", ".55 .58 .62 1", 'mass=".08" contype="5"')}
       <geom name="stop_knob" type="box" size=".010 .010 .006" pos="0 .006 .022" rgba=".85 .45 .2 1" mass=".01" contype="5" friction="3 .02 .002"/>
     </body>

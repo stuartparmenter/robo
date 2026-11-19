@@ -24,6 +24,7 @@ import {
 import {
   defaultCycles,
   defaultLayout,
+  type FinishOptions,
   guardSeconds,
   type HelpCategory,
   type Layout,
@@ -87,7 +88,7 @@ const puzzle = {
     title: "Work cell shift",
     goal: "Run a shift in this single-arm work cell. Each cycle a part arrives in the infeed nest. Follow the current work instruction: check the part, put nonconforming parts in the red reject bin, or load conforming parts into the machine and close it. Call finish to end each cycle. The work instruction can change during the shift.",
     criteria:
-      "Plant metrics. Never pass a nonconforming part. Avoid scrap and safety stops (wrist force over 30 N). Keep shift time low; each technician visit costs 90 seconds. The machine reports only what its sensors can see.",
+      "Score per cycle: a conforming part loaded and run correctly, or a nonconforming part rejected in the bin with the right reject_reason, +1 (a bin reject with a missing or wrong reason +0.5). A nonconforming part run in the machine (escape) −3. A conforming part run with the stop off its marks, off centre, or with debris in the slot (scrap) −1. A false reject or unfinished cycle 0. Each protective stop −0.5. Each technician visit −0.5, except one that clears a machine fault you cannot clear yourself. Shift score = total ÷ cycles. Time and model calls are reported, not scored. The machine reports only what its own sensors can see.",
   },
   machine: {
     title: "Machine loading",
@@ -259,7 +260,7 @@ async function start(id: string) {
         startRevision: string;
         cyclesDone: number;
         reports: unknown[];
-        question?: { text: string; camera: string };
+        question?: { id: number; text: string; camera: string };
         answer?: (text: string) => void;
       })
     | undefined;
@@ -390,6 +391,7 @@ async function start(id: string) {
       gripper,
       controller,
       shift: shiftReading,
+      machine: machineSignals,
     } = frame.readings;
     for (const camera of ["overhead", "side"] as const) cameras[camera].src = frame.images[camera];
     element("inspection-view").hidden = !frame.images.inspection;
@@ -408,6 +410,7 @@ async function start(id: string) {
         `Cycle  ${shiftReading.cycle} / ${shiftReading.cycles} · Rev ${shiftReading.work_instruction_revision} · ${shiftReading.cycle_seconds} s`,
       );
     }
+    if (machineSignals) lines.push(`Door  ${machineSignals.door_locked ? "locked" : "unlocked"}`);
     if (wrist_force_n && wrist_torque_nm && gripper && controller) {
       const xyz = ({ x, y, z }: { x: number; y: number; z: number }) => `${x}, ${y}, ${z}`;
       lines.push(
@@ -471,6 +474,13 @@ async function start(id: string) {
     incomplete: "Incomplete",
   };
 
+  const formatDuration = (seconds: number) =>
+    seconds >= 3600
+      ? `${Math.floor(seconds / 3600)} h ${Math.round((seconds % 3600) / 60)} min`
+      : seconds >= 60
+        ? `${Math.round(seconds / 60)} min`
+        : `${Math.round(seconds)} s`;
+
   function renderShift() {
     const shiftSummary = summary?.shift;
     if (!cell || !shiftSummary) return;
@@ -485,8 +495,13 @@ async function start(id: string) {
         result.revision,
         result.condition.replaceAll("_", " "),
         outcome +
+          (result.reason_correct === false ? " (wrong reason)" : "") +
+          (result.refusals ? ` · refused ×${result.refusals}` : "") +
           (helps ? ` · help ×${helps}` : "") +
-          (result.safety_events ? ` · ${result.safety_events} safety` : ""),
+          (result.safety_events
+            ? ` · ${result.safety_events} stop${result.safety_events > 1 ? "s" : ""}`
+            : "") +
+          (result.by_routine ? " · routine" : ""),
         String(result.moves),
         `${Math.round(result.seconds + result.help_seconds)} s`,
       ];
@@ -496,7 +511,17 @@ async function start(id: string) {
         if (i === 3)
           cellNode.className =
             result.outcome === "good" || result.outcome === "correct_reject" ? "good" : "bad";
-        cellNode.title = i === 3 ? result.machine_report : "";
+        cellNode.title =
+          i === 3
+            ? [
+                result.machine_report,
+                result.declared_reason && `Reason: ${result.declared_reason.replaceAll("_", " ")}`,
+                result.refusals && `Cycle start refused ×${result.refusals}`,
+                result.first_article && `First article: ${result.first_article}`,
+              ]
+                .filter(Boolean)
+                .join("\n")
+            : "";
         row.append(cellNode);
       }
       return row;
@@ -512,7 +537,7 @@ async function start(id: string) {
           spec.revision,
           spec.condition.replaceAll("_", " "),
           "In progress",
-          String(cycleBudget - sim.readings().moves_remaining),
+          String(sim.moveBudget - sim.readings().moves_remaining),
           `${Math.round(reading.cycle_seconds)} s`,
         ]) {
           const cellNode = document.createElement("td");
@@ -533,9 +558,17 @@ async function start(id: string) {
       safety_events,
       help_requests,
       seconds,
+      model_calls,
+      routine_cycles,
+      wall_seconds,
     } = shiftSummary;
+    const done = shiftSummary.results.length;
+    const autonomy =
+      model_calls === undefined
+        ? ""
+        : ` · ${model_calls} model calls (${done ? Math.round(model_calls / done) : 0}/cycle) · ${routine_cycles ?? 0}/${done} cycles by routine · ${formatDuration(wall_seconds ?? 0)} wall clock`;
     element("shift-summary").textContent =
-      `Score ${score} · good ${good} · rejected ${correct_rejects} · escapes ${escapes} · scrap ${scrap} · false rejects ${false_rejects} · safety ${safety_events} · help ${help_requests} · ${Math.round(seconds)} s`;
+      `Score ${score} · good ${good} · rejected ${correct_rejects} · escapes ${escapes} · scrap ${scrap} · false rejects ${false_rejects} · protective stops ${safety_events} · help ${help_requests} · ${Math.round(seconds)} s of motion${autonomy}`;
   }
 
   function renderRoutine() {
@@ -634,20 +667,27 @@ async function start(id: string) {
         seconds: result.seconds + result.help_seconds,
         moves: result.moves,
         ended_by: result.ended_by,
+        ...(result.first_article && { first_article: result.first_article }),
       }
     );
   }
 
   /** End the current cycle, or the whole attempt outside the work cell. */
-  function performFinish() {
+  function performFinish(options: FinishOptions = {}) {
     const revision = sim.cycleSpec?.revision;
-    sim.finish();
-    const readings = record(cell ? "Finish cycle" : "Finish").frame.readings;
-    const notice =
-      cell && !sim.ended && sim.cycleSpec?.revision !== revision
-        ? `Work instruction revision ${sim.cycleSpec?.revision} is in effect from this cycle. Call get_work_instruction.`
-        : undefined;
-    return { readings, notice };
+    const index = sim.cycleIndex;
+    const { refused } = sim.finish(options);
+    const readings = record(refused ? "Cycle start refused" : cell ? "Finish cycle" : "Finish").frame
+      .readings;
+    const ended = !cell || sim.ended || sim.cycleIndex !== index;
+    return { readings, notice: revisionNotice(revision), refused, ended };
+  }
+
+  /** Tell the agent when a cycle boundary brought in a new work instruction revision. */
+  function revisionNotice(before: string | undefined) {
+    return cell && !sim.ended && sim.cycleSpec?.revision !== before
+      ? `Work instruction revision ${sim.cycleSpec?.revision} is in effect from this cycle. Call get_work_instruction.`
+      : undefined;
   }
 
   const routineActive = () =>
@@ -659,7 +699,11 @@ async function start(id: string) {
     return {
       status: latest.status,
       ...(latest.message && { message: latest.message }),
-      ...(routine?.question && { question: routine.question.text, camera: routine.question.camera }),
+      ...(routine?.question && {
+        question_id: routine.question.id,
+        question: routine.question.text,
+        camera: routine.question.camera,
+      }),
       cycles_completed_by_routine: latest.cyclesDone ?? 0,
       cycle_reports: latest.reports ?? [],
       log_tail: latest.log.slice(-15),
@@ -687,6 +731,38 @@ async function start(id: string) {
       active.question = undefined;
       active.answer = undefined;
     };
+    sim.routineDriving = true;
+    try {
+      await runRoutineCycles(code, cycles, active, stop);
+    } catch (error) {
+      // Never leave the routine marked running: that would refuse every later act and finish.
+      sandbox.stop();
+      stop("error", errorMessage(error, "The routine host failed."));
+    } finally {
+      sim.routineDriving = false;
+    }
+    if (active.status === "running") stop("completed", `Ran ${active.cyclesDone} cycles.`);
+    routine = undefined;
+    // A stopped routine can no longer receive the reply to its open help request.
+    if (pendingHelp?.resolve) {
+      pendingHelp = undefined;
+      element("help-panel").hidden = true;
+    }
+    routineChanged();
+    if (summary)
+      void saveRun(summary, undefined, { runId: id, calls, omittedCalls, routines: routineRecords() }).catch(
+        storageWarning,
+      );
+  }
+
+  let questions = 0;
+
+  async function runRoutineCycles(
+    code: string,
+    cycles: number,
+    active: NonNullable<typeof routine>,
+    stop: (status: string, message?: string) => void,
+  ) {
     for (let done = 0; done < cycles; done++) {
       const current = sim.readings().shift;
       if (sim.ended || !current) {
@@ -722,6 +798,7 @@ async function start(id: string) {
             new Promise<string>((resolve) => {
               active.status = "asking";
               active.question = {
+                id: ++questions,
                 text,
                 camera: ["overhead", "side", "inspection"].includes(camera) ? camera : "overhead",
               };
@@ -756,7 +833,13 @@ async function start(id: string) {
         },
       );
       if (outcome.kind === "done") {
-        if (!sim.ended && sim.cycleIndex === index) performFinish();
+        if (!sim.ended && sim.cycleIndex === index) {
+          const finished = performFinish({ reject_reason: outcome.rejectReason });
+          if (finished.refused && !finished.ended) {
+            stop("handed_back", finished.refused);
+            break;
+          }
+        }
         active.cyclesDone++;
         active.reports.push(cycleReport());
         routineChanged();
@@ -770,18 +853,6 @@ async function start(id: string) {
       else stop("stopped", "The routine was stopped.");
       break;
     }
-    if (active.status === "running") stop("completed", `Ran ${active.cyclesDone} cycles.`);
-    routine = undefined;
-    // A stopped routine can no longer receive the reply to its open help request.
-    if (pendingHelp?.resolve) {
-      pendingHelp = undefined;
-      element("help-panel").hidden = true;
-    }
-    routineChanged();
-    if (summary)
-      void saveRun(summary, undefined, { runId: id, calls, omittedCalls, routines: routineRecords() }).catch(
-        storageWarning,
-      );
   }
 
   /** Storable copies of the routine records, without the live question callback IndexedDB cannot clone. */
@@ -863,6 +934,7 @@ async function start(id: string) {
     ) {
       return failure("A routine is running. Use routine_status to wait, answer, or stop it.");
     }
+    if (input.tool !== "get_assignment") sim.noteModelCall();
     // Readings captured by this call's frame, so they are not computed twice.
     let readings: Frame["readings"] | undefined;
     const extra: Record<string, unknown> = {};
@@ -872,19 +944,26 @@ async function start(id: string) {
       case "act": {
         if (sim.ended) return failure("This run has ended.");
         const cycle = sim.cycleIndex;
+        const revision = sim.cycleSpec?.revision;
         readings = performAct(input.command);
         if (cell && (sim.cycleIndex !== cycle || sim.ended)) {
           extra.cycle_report = cycleReport();
-          extra.notice = "The cycle's move budget ran out, so the cycle ended.";
+          extra.notice = [
+            "The cycle's move budget ran out, so the cycle ended without starting the machine.",
+            revisionNotice(revision),
+          ]
+            .filter(Boolean)
+            .join(" ");
         }
         camera = input.camera;
         break;
       }
       case "finish":
         if (!sim.ended) {
-          const finished = performFinish();
+          const finished = performFinish({ reject_reason: input.reject_reason });
           readings = finished.readings;
-          if (cell) {
+          if (finished.refused) extra.machine_report = finished.refused;
+          if (cell && finished.ended) {
             extra.cycle_report = cycleReport();
             if (finished.notice) extra.notice = finished.notice;
             if (sim.ended) extra.notice = "The shift is complete.";
@@ -925,7 +1004,15 @@ async function start(id: string) {
       }
       case "routine_status": {
         if (input.stop && routineActive()) sandbox.stop();
-        if (input.answer !== undefined && routine?.answer) routine.answer(input.answer);
+        if (input.answer !== undefined) {
+          if (!routine?.answer || !routine.question)
+            return failure("The routine is not waiting for an answer.");
+          if (input.question_id !== routine.question.id)
+            return failure(
+              `That answer is for question ${input.question_id ?? "(none)"}, but the open question is ${routine.question.id}. Read it with routine_status and answer with its question_id.`,
+            );
+          routine.answer(input.answer);
+        }
         await waitForRoutine(input.wait_s);
         if (input.stop) await waitForRoutine(1, true);
         extra.routine = routineSnapshot();
@@ -944,7 +1031,7 @@ async function start(id: string) {
       Object.assign(info, {
         goal: puzzle[sim.layout.task].goal,
         success_criteria: puzzle[sim.layout.task].criteria,
-        axes: "Overhead: +X right, +Y up. +Z is height above the table. Positive yaw rotates counterclockwise above +X. Pitch and roll are optional local Y and X rotations after yaw. Zero pitch and roll point the fingers down. Use mm and degrees. Z is the wrist's gripper target, 7 mm below the finger center.",
+        axes: "Overhead: +X right, +Y up. +Z is height above the table. Positive yaw rotates counterclockwise above +X. Pitch and roll are optional local Y and X rotations after yaw. Zero pitch and roll point the fingers down. Use mm and degrees. Z is the wrist's gripper target, 7 mm below the finger center. The fingertips are 9 mm below Z, and each finger is 32 mm long, 24 mm wide and 8 mm thick.",
         feedback:
           "Wrist force (N) and torque (N·m) are in world XYZ and tared for the empty tool. The gripper reports jaw width, motor effort, and object_detected when the closing jaws stall on something before reaching their closed position. Joint readings report controller angles and limits. Numerical readings are fresh even if the image is stale.",
         guarded_move: `Optional move_to guard: {force_n, speed_mm_s}. Moves slowly and stops and backs away when the wrist-force vector changes by force_n N relative to the start of the move. Guarded motion is limited to ${guardSeconds} seconds of travel per action.`,
@@ -962,14 +1049,18 @@ async function start(id: string) {
       }
       if (cell) {
         Object.assign(info, {
-          budget: `${cycleBudget} moves per cycle; a cycle that runs out of moves ends as it stands.`,
+          budget: `${cycleBudget} moves per cycle, ${cycleBudget * 2} on the first cycle and on the first cycle after a work instruction revision change. A cycle that runs out of moves ends as it stands, without starting the machine.`,
+          machine_signals:
+            "machine.door_locked is the machine's door interlock switch: true when the cover is closed and latched.",
+          finish:
+            "finish presses cycle start, or ends a cycle with no part in the machine. Pass reject_reason (oversize, left_hand or other) when the part went to the reject bin. The machine refuses to start with the cover unlatched, the gripper inside, or the part unseated; the cycle then continues and the refusal costs one move. QC reports on the first part run under each revision in cycle_report.first_article.",
           cell: "Stations: an infeed nest (grey-green plate with four corner pins) where each part arrives; a blue cradle with two raised supports for standing a part on edge; a red reject bin; a go/no-go length gauge with a white pocket (revision A) and a yellow pocket (revision B); and the machine: a teal plate with a slot between two low walls, an adjustable back stop with an orange knob, a sliding cover on gold rails and a red latch button. Find their positions from the cameras.",
           work_instruction:
             "Call get_work_instruction for the current revision's text and drawing. finish replies say when a new revision takes effect.",
-          help: `request_help(category, observation) calls a technician for the current cycle. Categories: machine_fault, debris, part_quality, other. Each visit costs ${helpSeconds} s of shift time, and the technician only fixes what your category names.${layout.attended ? " A person answers requests in this run; replies arrive in later tool results as help_responses." : ""}`,
-          safety: `A wrist force above ${safetyForce} N is recorded as a safety event.`,
+          help: `request_help(category, observation) calls a technician for the current cycle. Categories: machine_fault, debris, part_quality, other. Each visit costs ${helpSeconds} s of shift time and 0.5 points, unless it clears a machine fault you cannot clear yourself. The technician only fixes what your category names.${layout.attended ? " A person answers requests in this run; replies arrive in later tool results as help_responses." : ""}`,
+          safety: `A wrist force held above ${safetyForce} N for 10 ms trips a protective stop: the move halts where it is and stop_reason is protective_stop. Each one costs 0.5. Your next command resumes. shift.protective_stops_cycle and protective_stops_shift count them.`,
           routines:
-            "run_routine(code, cycles) runs your JavaScript `async function run(robot, cycle)` once per cycle, starting with the current cycle (only before its first move). cycle = {number, of, revision}. robot.act(command) performs one command and resolves to the readings (no images). robot.readings() returns current readings. robot.ask(question, camera) pauses and asks you; answer with routine_status({answer}), which shows you that camera. robot.requestHelp(category, observation) resolves to the technician's reply. robot.handBack(message) returns control to you mid-cycle. robot.log(...) adds to the status log. Returning from run ends the cycle like finish. A thrown error returns control to you mid-cycle. A routine pauses before any cycle with a different work instruction revision. Moves count against each cycle's budget as usual. The code runs in a sandbox without network access. Poll routine_status while it runs.",
+            "run_routine(code, cycles) runs your JavaScript `async function run(robot, cycle)` once per cycle, starting with the current cycle (only before its first move). cycle = {number, of, revision}. robot.act(command) performs one command and resolves to the readings (no images). await robot.readings() for current readings (it returns a promise, like every robot call). robot.ask(question, camera) pauses and asks you; answer with routine_status({answer, question_id}), which shows you that camera. robot.requestHelp(category, observation) resolves to the technician's reply. robot.handBack(message) returns control to you mid-cycle. robot.log(...) adds to the status log. Returning from run presses cycle start like finish; return {reject_reason} after binning a part. If the machine refuses to start, control returns to you mid-cycle. A thrown error returns control to you mid-cycle. A routine pauses before any cycle with a different work instruction revision. Moves count against each cycle's budget as usual. The code runs in a sandbox without network access. Poll routine_status while it runs.",
         });
       }
     }

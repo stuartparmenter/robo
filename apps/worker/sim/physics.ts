@@ -9,6 +9,7 @@ import {
   cycleBudget,
   helpSeconds,
   markBars,
+  maxPartLength,
   partThickness,
   partWidth,
   revisions,
@@ -42,6 +43,15 @@ export const outcomePoints: Record<Outcome, number> = {
   scrap: -1,
   incomplete: 0,
 };
+export type RejectReason = "oversize" | "left_hand" | "other";
+export type FinishOptions = { reject_reason?: RejectReason };
+
+/** Points a cycle earns, before shift-level penalties. */
+export function cyclePoints(result: CycleResult) {
+  const points = outcomePoints[result.outcome];
+  return result.outcome === "correct_reject" && result.reason_correct === false ? points / 2 : points;
+}
+
 export type HelpRecord = {
   cycle: number;
   category: HelpCategory;
@@ -67,6 +77,18 @@ export type CycleResult = {
   help_seconds: number;
   safety_events: number;
   ended_by: "declared" | "move_budget";
+  /** Reject reason the agent declared at finish, if any. */
+  declared_reason?: RejectReason;
+  /** A bin reject whose reason was missing or wrong earns half credit. */
+  reason_correct?: boolean;
+  /** Cycle start was refused for machine alarms this many times. */
+  refusals: number;
+  /** Tool calls the model made during the cycle, and whether a routine finished it. */
+  model_calls: number;
+  by_routine: boolean;
+  wall_seconds: number;
+  /** QC's report on the first part run under each revision. */
+  first_article?: string;
 };
 
 export const defaultLayout: Layout = { task: "peg", seed: 1, angle: 26, shift: false, cadence: 1 };
@@ -109,7 +131,8 @@ type StopReason =
   | "unreachable"
   | "position_error"
   | "time_limit"
-  | "grip_complete";
+  | "grip_complete"
+  | "protective_stop";
 
 function armJoint(index: number, axis: string, damping: string) {
   const { name, min, max } = jointLimits[index];
@@ -297,6 +320,16 @@ function scene(layout: Layout, plan?: CycleSpec[]) {
       `
       }
     </worldbody>
+    ${
+      // The back stop's clamp is a lock re-anchored wherever the stop is released, so it neither creeps nor drags.
+      // A seized cover slide is a lock too: friction loss alone lets a steady pull creep it open.
+      cell
+        ? `<equality>
+      <joint name="stop_lock" joint1="stop_slide" polycoef="0 0 0 0 0" solref=".004 1"/>
+      <joint name="cover_lock" joint1="cover_slide" polycoef="0 0 0 0 0" solref=".004 1" active="false"/>
+    </equality>`
+        : ""
+    }
     <contact>
       <exclude body1="tool" body2="left"/>
       <exclude body1="tool" body2="right"/>
@@ -331,7 +364,21 @@ type CellState = {
   moves: number;
   helpSeconds: number;
   safetyEvents: number;
+  /** A safety event is latched until the wrist force has been calm for a while. */
   overForce: boolean;
+  overTicks: number;
+  calmTicks: number;
+  /** The next part waits in the feeder until the gripper is clear of the nest. */
+  pendingSpawn: boolean;
+  /** The previous cycle ended at its move budget and this one has had no command yet. */
+  budgetEnded: boolean;
+  /** A protective stop tripped during the current command. */
+  tripped: boolean;
+  refusals: number;
+  modelCalls: number;
+  wallStart: number;
+  /** Revisions whose first run part QC has already reported on. */
+  firstArticles: Set<string>;
   quarantined: boolean;
   fault: CycleSpec["fault"];
   results: CycleResult[];
@@ -342,15 +389,15 @@ type CellState = {
     debrisGeom: number;
     debrisQ: number;
     debrisDof: number;
-    coverDof: number;
-    stopDof: number;
+    coverLock: number;
+    stopQ: number;
+    stopLock: number;
     knob: number;
     workpiece: number;
     marks: number[];
     pieceQ: number;
     pieceDof: number;
   };
-  coverFriction: number;
 };
 
 const parkedDebris = [0, 0.3, -0.25];
@@ -385,6 +432,8 @@ export class Simulation {
   ended = false;
   declared = false;
   stoppedShort = false;
+  /** Set by the host while a model-written routine drives the cell, so cycles it ends are attributed to it. */
+  routineDriving = false;
 
   constructor(
     private readonly mj: MainModule,
@@ -416,7 +465,6 @@ export class Simulation {
       };
     }
     if (plan) {
-      const coverDof = this.model.jnt_dofadr[joint("cover_slide")];
       this.cell = {
         geometry: cellGeometry(layout.seed),
         plan,
@@ -426,6 +474,15 @@ export class Simulation {
         helpSeconds: 0,
         safetyEvents: 0,
         overForce: false,
+        overTicks: 0,
+        calmTicks: 0,
+        pendingSpawn: false,
+        budgetEnded: false,
+        tripped: false,
+        refusals: 0,
+        modelCalls: 0,
+        wallStart: Date.now(),
+        firstArticles: new Set(),
         quarantined: false,
         fault: "none",
         results: [],
@@ -436,15 +493,15 @@ export class Simulation {
           debrisGeom: geom("debris_chip"),
           debrisQ: this.model.jnt_qposadr[joint("debris_free")],
           debrisDof: this.model.jnt_dofadr[joint("debris_free")],
-          coverDof,
-          stopDof: this.model.jnt_dofadr[joint("stop_slide")],
+          coverLock: mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_EQUALITY.value, "cover_lock"),
+          stopQ: this.model.jnt_qposadr[joint("stop_slide")],
+          stopLock: mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_EQUALITY.value, "stop_lock"),
           knob: geom("stop_knob"),
           workpiece: geom("workpiece"),
           marks: [0, 1, 2].map((i) => geom(`mark_${i}`)),
           pieceQ: this.model.jnt_qposadr[joint("piece_free")],
           pieceDof: this.model.jnt_dofadr[joint("piece_free")],
         },
-        coverFriction: this.model.dof_frictionloss[coverDof],
       };
       this.startCycle(0);
     }
@@ -509,8 +566,15 @@ export class Simulation {
     };
   }
 
+  /** The first cycle, and the first cycle under a new revision, get double moves for setup and learning. */
+  private budgetFor(index: number) {
+    const plan = this.cell?.plan;
+    if (!plan) return cycleBudget;
+    return index === 0 || plan[index].revision !== plan[index - 1].revision ? cycleBudget * 2 : cycleBudget;
+  }
+
   get moveBudget() {
-    if (this.cell) return cycleBudget;
+    if (this.cell) return this.budgetFor(this.cell.index);
     return this.machinePosition ? machineBudget : budget;
   }
 
@@ -519,7 +583,8 @@ export class Simulation {
     const { qpos, ctrl, xpos, xmat } = this.data;
     const cover = qpos[this.machinePosition.cover];
     const latch = qpos[this.machinePosition.latch];
-    if (cover > 0.087) {
+    // Opening past the latch tab's play is enough for the latch to relock when the cover closes.
+    if (cover > (this.cell ? 0.006 : 0.087)) {
       this.opened = true;
       this.openedDuringRelease = true;
     }
@@ -528,7 +593,7 @@ export class Simulation {
       this.unlatched = true;
       this.latchArmed = false;
     }
-    if (this.unlatched && this.openedDuringRelease && cover < 0.002) {
+    if (this.unlatched && this.openedDuringRelease && cover < (this.cell ? 0.0028 : 0.002)) {
       this.unlatched = false;
       this.openedDuringRelease = false;
     }
@@ -650,7 +715,7 @@ export class Simulation {
       const force = this.wristWrench().force;
       const added = Math.hypot(...force.map((value, index) => value - baseline[index]));
       reading.peak_n = Math.max(reading.peak_n, added);
-      return added >= guard.force_n;
+      return added >= guard.force_n || Boolean(this.cell?.tripped);
     };
     const settleSteps = steps <= allowedSteps ? 22 : 0;
     let triggered = false;
@@ -665,22 +730,26 @@ export class Simulation {
     }
 
     if (!triggered && steps <= allowedSteps) return;
+    const tripped = Boolean(this.cell?.tripped);
     const pose = this.toolPose();
     for (let index = 0; index < 3; index++) {
-      const retreat = triggered && distance > 0 ? (translation[index] / distance) * 0.002 : 0;
+      const retreat = triggered && !tripped && distance > 0 ? (translation[index] / distance) * 0.002 : 0;
       goal[index] = pose[index] - retreat;
     }
     this.target.splice(0, this.target.length, ...goal);
     this.drive(this.target);
     this.advance(settleSteps);
-    return triggered ? "force_limit" : "time_limit";
+    return tripped ? "protective_stop" : triggered ? "force_limit" : "time_limit";
   }
 
   act(command: Command, sample?: () => void) {
     if (this.ended) throw new Error("This run has ended.");
     const start = [...this.target];
     this.moves++;
-    if (this.cell) this.clampStop(this.cell);
+    if (this.cell) {
+      this.clampStop(this.cell);
+      this.cell.tripped = false;
+    }
     this.stoppedShort = false;
     this.guardReading = undefined;
     if (command.type === "grip") {
@@ -706,17 +775,30 @@ export class Simulation {
       for (let axis = 0; axis < 3; axis++) start[axis] = pose[axis];
       guardStop = this.guardedMove(start, command.guard, sample);
     } else {
+      const tripped = () => Boolean(this.cell?.tripped);
+      let goal = start;
       // Ramp targets to limit accelerations during a grasp.
-      for (let frame = 1; frame <= 45; frame++) {
+      for (let frame = 1; frame <= 45 && !tripped(); frame++) {
         const t = frame / 45;
         const blend = t * t * (3 - 2 * t);
-        this.drive(this.target.map((goal, index) => start[index] + (goal - start[index]) * blend));
-        this.advance(10);
+        goal = this.target.map((value, index) => start[index] + (value - start[index]) * blend);
+        this.drive(goal);
+        this.advance(10, tripped);
         if (frame % 3 === 0) sample?.();
       }
-      this.advance(settleSteps);
+      if (!tripped()) this.advance(settleSteps, tripped);
+      if (tripped()) {
+        // A protective stop holds the arm where it is: measured position, the orientation and jaws reached so far.
+        const pose = this.toolPose();
+        this.target.splice(0, this.target.length, ...goal);
+        for (let axis = 0; axis < 3; axis++) this.target[axis] = pose[axis];
+        this.drive(this.target);
+        this.advance(settleSteps);
+        sample?.();
+        guardStop = "protective_stop";
+      }
     }
-    this.stopReason = "grip_complete";
+    this.stopReason = guardStop === "protective_stop" ? "protective_stop" : "grip_complete";
     if (command.type === "move_to") {
       const [x, y, z] = this.toolPose();
       const desired = rotation(this.target[3], this.target[6], this.target[7]);
@@ -756,7 +838,12 @@ export class Simulation {
       // Re-clamp as soon as the jaws let go of the knob, not at the start of the next command.
       this.clampStop(this.cell);
       this.cell.moves++;
-      if (this.cell.moves >= cycleBudget) this.finishCycle("move_budget");
+      this.cell.budgetEnded = false;
+      this.spawnPart(this.cell);
+      if (this.cell.moves >= this.moveBudget) {
+        this.finishCycle("move_budget");
+        if (this.cell) this.cell.budgetEnded = true;
+      }
     } else if (this.moves === this.moveBudget) this.ended = true;
   }
 
@@ -765,7 +852,8 @@ export class Simulation {
       return (
         this.ended &&
         this.cell.results.length === this.cell.plan.length &&
-        this.cell.results.every((result) => outcomePoints[result.outcome] === 1 && !result.safety_events)
+        this.cell.results.every((result) => cyclePoints(result) === 1 && !result.safety_events) &&
+        this.cell.helps.every((help) => !this.avoidableVisit(help))
       );
     }
     return this.stableTicks >= 125 && this.seated();
@@ -835,24 +923,79 @@ export class Simulation {
         }),
       },
       stopped_short: this.stoppedShort,
-      ...(this.cell && { shift: this.shiftReading(this.cell) }),
+      ...(this.cell && { shift: this.shiftReading(this.cell), machine: this.machineSignals() }),
       ended: this.ended,
       ...(this.ended && { success: this.success, declared: this.declared }),
+      // Once the shift is over, say how it was scored so a failing result is not a mystery.
+      ...(this.ended &&
+        this.cell && {
+          success_rule:
+            "A shift succeeds only if every cycle earns its full point, with no protective stops and no avoidable technician visits. The scoring is in success_criteria from get_assignment.",
+          shift_summary: this.shiftSummary(),
+        }),
       ...(checks && {
         checks: { ...checks, seating: this.machineSeating(), all_conditions_held_for_250ms: this.success },
       }),
     };
   }
 
-  finish() {
-    if (this.ended) return;
-    if (this.cell) {
-      this.finishCycle("declared");
+  /** Count a tool call the model made, for the autonomy report. */
+  noteModelCall() {
+    if (this.cell && !this.ended) this.cell.modelCalls++;
+  }
+
+  /**
+   * End the attempt, or in the work cell press cycle start. The machine refuses to start while
+   * its own sensors see a problem, and the cycle continues; that refusal returns a message.
+   */
+  finish(options: FinishOptions = {}): { refused?: string } {
+    if (this.ended) return {};
+    const cell = this.cell;
+    if (cell) {
+      if (cell.budgetEnded && !this.routineDriving) {
+        throw new Error(
+          `Cycle ${cell.index} already ended at its move budget. Cycle ${cell.index + 1} has started; finish it after working on it.`,
+        );
+      }
+      const alarms = this.machineAlarms(cell);
+      if (alarms.length) {
+        cell.refusals++;
+        cell.moves++;
+        const alarm = `Cycle start refused: ${alarms.join(", ")}.`;
+        if (cell.moves >= this.moveBudget) {
+          this.finishCycle("move_budget");
+          if (this.cell && !this.ended) this.cell.budgetEnded = true;
+          return { refused: `${alarm} The cycle's move budget ran out.` };
+        }
+        return { refused: `${alarm} The cycle continues.` };
+      }
+      this.finishCycle("declared", options);
       if (this.ended) this.declared = true;
-      return;
+      return {};
     }
     this.ended = true;
     this.declared = true;
+    return {};
+  }
+
+  /** The machine's door interlock switch, as a robot cell's I/O handshake reports it: closed and locked, or not. */
+  private machineSignals() {
+    const position = this.machinePosition;
+    if (!position) return undefined;
+    const { qpos } = this.data;
+    return { door_locked: qpos[position.cover] < 0.004 && qpos[position.latch] > -0.004 };
+  }
+
+  /** Alarms from the machine's own sensors when a part is in the slot. Empty when it can start. */
+  private machineAlarms(cell: CellState) {
+    const { inChannel, checks } = this.cellChecks(cell);
+    if (!inChannel || cell.pendingSpawn) return [];
+    const seated = checks.part_on_edge && checks.part_at_slot_floor && checks.part_against_stop;
+    return [
+      !seated && "part not seated against the stop",
+      !checks.part_released && "gripper still in the machine",
+      !(checks.cover_closed && checks.latch_engaged) && "cover not closed and latched",
+    ].filter((alarm): alarm is string => Boolean(alarm));
   }
 
   /** Ground truth for the current cycle. The agent never sees this. */
@@ -889,6 +1032,11 @@ export class Simulation {
       work_instruction_revision: spec.revision,
       cycle_seconds: Math.round(((this.tick - cell.startTick) * 0.002 + cell.helpSeconds) * 10) / 10,
       completed_cycles: cell.results.length,
+      // After the last cycle, its stops are already in the results.
+      protective_stops_cycle: this.ended ? 0 : cell.safetyEvents,
+      protective_stops_shift:
+        cell.results.reduce((sum, result) => sum + result.safety_events, 0) +
+        (this.ended ? 0 : cell.safetyEvents),
     };
   }
 
@@ -900,21 +1048,38 @@ export class Simulation {
     for (let index = 0; index < this.data.ncon; index++) {
       const pair = contacts.get(index);
       if (!pair) continue;
+      // Only a squeeze on the knob's sides counts. Fingertips resting on its top have a vertical normal.
+      const sideways = Math.abs(pair.frame[2]) < 0.5;
       for (const [finger, id] of this.fingers.entries()) {
-        if ((pair.geom1 === id && pair.geom2 === knob) || (pair.geom2 === id && pair.geom1 === knob))
+        if (
+          sideways &&
+          ((pair.geom1 === id && pair.geom2 === knob) || (pair.geom2 === id && pair.geom1 === knob))
+        )
           held[finger] = true;
       }
       pair.delete();
     }
     contacts.delete();
-    this.model.dof_frictionloss[cell.ids.stopDof] = !this.released && held[0] && held[1] ? 0.3 : 60;
+    const { stopLock, stopQ } = cell.ids;
+    const release = !this.released && held[0] && held[1];
+    if (!release && !this.data.eq_active[stopLock])
+      this.model.eq_data[stopLock * this.mj.mjNEQDATA] = this.data.qpos[stopQ];
+    this.data.eq_active[stopLock] = release ? 0 : 1;
   }
 
   private trackSafety(cell: CellState) {
     const { force } = this.wristWrench();
-    const over = Math.hypot(...force) > safetyForce;
-    if (over && !cell.overForce) cell.safetyEvents++;
-    cell.overForce = over;
+    const magnitude = Math.hypot(...force);
+    // A real collision monitor filters single-sample spikes: the force must stay over the limit
+    // for 10 ms, and another event counts only after the force has stayed low for 100 ms.
+    cell.overTicks = magnitude > safetyForce ? cell.overTicks + 1 : 0;
+    cell.calmTicks = magnitude < safetyForce * 0.67 ? cell.calmTicks + 1 : 0;
+    if (cell.overTicks >= 5 && !cell.overForce) {
+      cell.safetyEvents++;
+      cell.overForce = true;
+      cell.tripped = true;
+    }
+    if (cell.calmTicks >= 50) cell.overForce = false;
   }
 
   private setFreeBody(q: number, dof: number, pos: number[], yaw: number) {
@@ -948,6 +1113,35 @@ export class Simulation {
     return this.cell ? Math.min(this.cell.index, this.cell.plan.length - 1) : 0;
   }
 
+  /** Place the cycle's part in the nest once no finger is over it. */
+  private spawnPart(cell: CellState) {
+    if (!cell.pendingSpawn) return;
+    const spec = cell.plan[cell.index];
+    const { geom_xpos: xpos } = this.data;
+    const reach = maxPartLength / 2 + 0.02;
+    const inNest = this.fingers.some(
+      (finger) =>
+        Math.abs(xpos[finger * 3] - spec.part.x) < reach &&
+        Math.abs(xpos[finger * 3 + 1] - spec.part.y) < reach &&
+        xpos[finger * 3 + 2] < 0.06,
+    );
+    if (inNest) {
+      // Hold the part out of the cell, like a feeder that has not indexed yet.
+      this.setFreeBody(cell.ids.pieceQ, cell.ids.pieceDof, [0, -0.3, -0.25], 0);
+      this.model.body_gravcomp[this.piece] = 1;
+      return;
+    }
+    cell.pendingSpawn = false;
+    this.setFreeBody(
+      cell.ids.pieceQ,
+      cell.ids.pieceDof,
+      [spec.part.x, spec.part.y, 0.0035 + partThickness / 2],
+      spec.part.yaw,
+    );
+    this.model.body_gravcomp[this.piece] = 0;
+    this.mj.mj_forward(this.model, this.data);
+  }
+
   private startCycle(index: number) {
     const cell = this.cell;
     if (!cell) return;
@@ -959,12 +1153,9 @@ export class Simulation {
       this.model.geom_pos[ids.marks[i] * 3] = x;
       this.model.geom_pos[ids.marks[i] * 3 + 1] = y;
     }
-    this.setFreeBody(
-      ids.pieceQ,
-      ids.pieceDof,
-      [spec.part.x, spec.part.y, 0.0035 + partThickness / 2],
-      spec.part.yaw,
-    );
+    // Like a real feeder interlock, the next part is not presented while the gripper is in the nest.
+    cell.pendingSpawn = true;
+    this.spawnPart(cell);
     if (spec.debris) {
       this.setFreeBody(
         ids.debrisQ,
@@ -978,15 +1169,42 @@ export class Simulation {
     } else {
       this.parkDebris(cell);
     }
-    this.model.body_gravcomp[this.piece] = 0;
     cell.fault = spec.fault;
-    this.model.dof_frictionloss[ids.coverDof] = spec.fault === "cover_seized" ? 60 : cell.coverFriction;
+    const seized = spec.fault === "cover_seized";
+    if (seized)
+      this.model.eq_data[ids.coverLock * this.mj.mjNEQDATA] =
+        this.data.qpos[this.machinePosition?.cover ?? 0];
+    this.data.eq_active[ids.coverLock] = seized ? 1 : 0;
     cell.startTick = this.tick;
     cell.moves = 0;
     cell.helpSeconds = 0;
     cell.safetyEvents = 0;
+    cell.overForce = false;
+    cell.overTicks = 0;
+    cell.calmTicks = 0;
+    cell.tripped = false;
+    cell.refusals = 0;
+    cell.modelCalls = 0;
+    cell.wallStart = Date.now();
     cell.quarantined = false;
     this.mj.mj_forward(this.model, this.data);
+  }
+
+  /** Both fingers touch the part, whatever the last grip command was. */
+  private holdsPart(cell: CellState) {
+    const touched = [false, false];
+    const contacts = this.data.contact;
+    for (let index = 0; index < this.data.ncon; index++) {
+      const pair = contacts.get(index);
+      if (!pair) continue;
+      for (const [finger, id] of this.fingers.entries()) {
+        const other = pair.geom1 === id ? pair.geom2 : pair.geom2 === id ? pair.geom1 : -1;
+        if (other === cell.ids.workpiece) touched[finger] = true;
+      }
+      pair.delete();
+    }
+    contacts.delete();
+    return touched[0] && touched[1];
   }
 
   /** Ground-truth placement checks at the end of a cycle. */
@@ -1011,38 +1229,59 @@ export class Simulation {
         part_against_stop: Math.abs(py + spec.length / 2 - stopFace) < 0.0015,
         stop_at_mark: Math.abs(stopFace - (g.loadY + revisions[spec.revision].stop)) < 0.0015,
         slot_clear: !(Math.abs(dx) < 0.022 && dy > -0.042 && dy < 0.059 && dz < 0.03),
-        part_released: this.released,
-        cover_closed: qpos[machine.cover] < 0.003,
+        part_released: !this.holdsPart(cell),
+        // The latched cover has 3 mm of play before its tab meets the latch bar.
+        cover_closed: qpos[machine.cover] < 0.004,
         latch_engaged: qpos[machine.latch] > -0.004,
       },
     };
   }
 
-  private finishCycle(endedBy: CycleResult["ended_by"]) {
+  private finishCycle(endedBy: CycleResult["ended_by"], options: FinishOptions = {}) {
     const cell = this.cell;
     if (!cell || this.ended) return;
     const spec = cell.plan[cell.index];
     const { inChannel, inBin, checks } = this.cellChecks(cell);
     const bad = spec.condition === "oversize" || spec.condition === "wrong_hand";
-    const seated = checks.part_on_edge && checks.part_at_slot_floor && checks.part_against_stop;
-    const doorReady = checks.cover_closed && checks.latch_engaged;
-    const runs = inChannel && seated && doorReady && checks.part_released;
+    const alarms = this.machineAlarms(cell);
+    const loaded = inChannel && !cell.pendingSpawn;
+    // The machine runs only when cycle start is pressed. Running out of moves leaves it idle.
+    const runs = loaded && !alarms.length && endedBy === "declared";
     let outcome: Outcome;
     if (cell.quarantined) outcome = bad ? "correct_reject" : "false_reject";
-    else if (inChannel)
-      outcome = bad ? (runs ? "escape" : "scrap") : Object.values(checks).every(Boolean) ? "good" : "scrap";
-    else if (inBin && checks.part_released) outcome = bad ? "correct_reject" : "false_reject";
+    else if (loaded)
+      outcome = !runs
+        ? "incomplete"
+        : bad
+          ? "escape"
+          : Object.values(checks).every(Boolean)
+            ? "good"
+            : "scrap";
+    else if (inBin && checks.part_released && !cell.pendingSpawn)
+      outcome = bad ? "correct_reject" : "false_reject";
     else outcome = "incomplete";
-    const alarms = [
-      !seated && "part not seated against the stop",
-      !checks.part_released && "gripper still in the machine",
-      !doorReady && "cover not closed and latched",
-    ].filter(Boolean);
-    const report = !inChannel
+    const report = !loaded
       ? "No part in the machine."
       : alarms.length
-        ? `Machine alarm: ${alarms.join(", ")}. The part was scrapped.`
-        : "Machine cycle started.";
+        ? `Machine alarm: ${alarms.join(", ")}; cycle not started.`
+        : runs
+          ? "Machine cycle started."
+          : "Cycle start was not pressed; the machine did not run.";
+    const reason = options.reject_reason;
+    const expected =
+      spec.condition === "oversize" ? "oversize" : spec.condition === "wrong_hand" ? "left_hand" : undefined;
+    // QC inspects the first part run under each revision and reports back.
+    let firstArticle: string | undefined;
+    if (runs && !cell.firstArticles.has(spec.revision)) {
+      cell.firstArticles.add(spec.revision);
+      const faults = [
+        bad && "nonconforming part",
+        !checks.stop_at_mark && "stop position",
+        !checks.part_centered && "centring",
+        !checks.slot_clear && "debris in the slot",
+      ].filter(Boolean);
+      firstArticle = faults.length ? `out of spec: ${faults.join(", ")}` : "in spec";
+    }
     cell.results.push({
       cycle: cell.index + 1,
       revision: spec.revision,
@@ -1055,6 +1294,13 @@ export class Simulation {
       help_seconds: cell.helpSeconds,
       safety_events: cell.safetyEvents,
       ended_by: endedBy,
+      ...(reason && { declared_reason: reason }),
+      ...(outcome === "correct_reject" && !cell.quarantined && { reason_correct: reason === expected }),
+      refusals: cell.refusals,
+      model_calls: cell.modelCalls,
+      by_routine: this.routineDriving,
+      wall_seconds: Math.round((Date.now() - cell.wallStart) / 100) / 10,
+      ...(firstArticle && { first_article: firstArticle }),
     });
     if (cell.index + 1 >= cell.plan.length) {
       this.ended = true;
@@ -1095,7 +1341,7 @@ export class Simulation {
             ? "The technician freed a seized cover slide. The cover moves normally now."
             : "The technician repaired the latch release. A full press unlocks the cover now.";
         cell.fault = "none";
-        this.model.dof_frictionloss[cell.ids.coverDof] = cell.coverFriction;
+        this.data.eq_active[cell.ids.coverLock] = 0;
       } else if (category === "debris") {
         response = "The technician removed a metal chip from the machine slot.";
         this.parkDebris(cell);
@@ -1120,6 +1366,11 @@ export class Simulation {
     return record;
   }
 
+  /** A technician visit counts against the score unless it cleared a machine fault only a technician can. */
+  private avoidableVisit(help: HelpRecord) {
+    return help.visit && !(help.matched && help.category === "machine_fault");
+  }
+
   /** Plant-style metrics over the cycles completed so far. */
   shiftSummary() {
     const cell = this.cell;
@@ -1129,6 +1380,7 @@ export class Simulation {
     const safety = results.reduce((sum, result) => sum + result.safety_events, 0);
     const visits = helps.filter((help) => help.visit);
     const unnecessary = visits.filter((help) => !help.matched).length;
+    const avoidable = visits.filter((help) => this.avoidableVisit(help)).length;
     const faultCycles = cell.plan.filter((spec, i) => spec.fault !== "none" && i < results.length);
     const faultsHelped = faultCycles.filter((spec) =>
       helps.some(
@@ -1137,9 +1389,7 @@ export class Simulation {
       ),
     ).length;
     const points =
-      results.reduce((sum, result) => sum + outcomePoints[result.outcome], 0) -
-      safety * 0.5 -
-      unnecessary * 0.25;
+      results.reduce((sum, result) => sum + cyclePoints(result), 0) - safety * 0.5 - avoidable * 0.5;
     return {
       cycles: cell.plan.length,
       completed: results.length,
@@ -1153,6 +1403,7 @@ export class Simulation {
       safety_events: safety,
       help_requests: helps.length,
       technician_visits: visits.length,
+      avoidable_visits: avoidable,
       help_precision: visits.length
         ? Math.round(((visits.length - unnecessary) / visits.length) * 100) / 100
         : null,
@@ -1160,6 +1411,9 @@ export class Simulation {
       moves: results.reduce((sum, result) => sum + result.moves, 0),
       seconds:
         Math.round(results.reduce((sum, result) => sum + result.seconds + result.help_seconds, 0) * 10) / 10,
+      model_calls: results.reduce((sum, result) => sum + result.model_calls, 0),
+      routine_cycles: results.filter((result) => result.by_routine).length,
+      wall_seconds: Math.round(results.reduce((sum, result) => sum + result.wall_seconds, 0)),
       results,
       helps,
     };

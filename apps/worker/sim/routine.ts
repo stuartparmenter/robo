@@ -4,6 +4,8 @@
  * the robot only through a MessagePort.
  */
 
+import type { RejectReason } from "./physics";
+
 export type RoutineCalls = {
   act(command: unknown): Promise<unknown>;
   readings(): unknown;
@@ -13,7 +15,7 @@ export type RoutineCalls = {
 };
 
 export type CycleOutcome =
-  | { kind: "done" }
+  | { kind: "done"; rejectReason?: RejectReason }
   | { kind: "handed_back"; message: string }
   | { kind: "error"; message: string }
   | { kind: "timeout" }
@@ -56,8 +58,8 @@ onmessage = async (event) => {
   try {
     const run = new Function(message.code + "\\n;return typeof run === 'function' ? run : undefined;")();
     if (typeof run !== "function") throw new Error("Define async function run(robot, cycle).");
-    await run(robot, message.cycle);
-    postMessage({ type: "done" });
+    const result = await run(robot, message.cycle);
+    postMessage({ type: "done", rejectReason: result && typeof result === "object" ? String(result.reject_reason ?? "") : "" });
   } catch (error) {
     postMessage({ type: "error", message: String(error && error.stack || error).slice(0, 1500) });
   }
@@ -75,10 +77,12 @@ onmessage = (event) => {
     if (message.type === "start") {
       worker?.terminate();
       worker = new Worker(URL.createObjectURL(new Blob([message.source], { type: "text/javascript" })));
-      worker.onmessage = (reply) => port.postMessage(reply.data);
+      // Tag everything this worker sends with its run, so late messages from a finished cycle are dropped.
+      const run = message.run;
+      worker.onmessage = (reply) => port.postMessage({ ...reply.data, run });
       worker.onerror = (error) => {
         error.preventDefault();
-        port.postMessage({ type: "error", message: error.message || "Routine error." });
+        port.postMessage({ type: "error", message: error.message || "Routine error.", run });
       };
       worker.postMessage({ type: "run", code: message.code, cycle: message.cycle });
     } else if (message.type === "reply") {
@@ -96,6 +100,7 @@ export class RoutineSandbox {
   private frame?: HTMLIFrameElement;
   private port?: MessagePort;
   private finishCycle?: (outcome: CycleOutcome) => void;
+  private runs = 0;
 
   private async connect() {
     if (this.port) return this.port;
@@ -124,9 +129,11 @@ export class RoutineSandbox {
   /** Run one cycle of the routine. Resolves when it returns, throws, hands back, stalls or is stopped. */
   async runCycle(code: string, cycle: unknown, calls: RoutineCalls): Promise<CycleOutcome> {
     const port = await this.connect();
+    const run = ++this.runs;
     return new Promise<CycleOutcome>((resolve) => {
       let watchdog = 0;
-      let waiting = false;
+      // Calls waiting on a person or the model (ask, requestHelp) pause the watchdog until all resolve.
+      let waiting = 0;
       // Calls that resume after this cycle settles must not touch the port, which a later cycle may own.
       let settled = false;
       const arm = () => {
@@ -148,38 +155,48 @@ export class RoutineSandbox {
         port.postMessage({ type: "reply", id, value, error });
       port.onmessage = async (event) => {
         const message = event.data;
-        if (message.type === "done") return settle({ kind: "done" });
+        if (message.run !== run) return;
+        if (message.type === "done") {
+          const reason = String(message.rejectReason ?? "");
+          return settle({
+            kind: "done",
+            ...(["oversize", "left_hand", "other"].includes(reason) && {
+              rejectReason: reason as RejectReason,
+            }),
+          });
+        }
         if (message.type === "error") return settle({ kind: "error", message: String(message.message) });
         if (message.type === "log") return calls.log(String(message.text));
         if (message.type !== "call") return;
         const { id, method, args } = message as { id: number; method: string; args: unknown[] };
         arm();
+        if (method === "handBack") return settle({ kind: "handed_back", message: String(args[0] ?? "") });
+        const waits = method === "ask" || method === "requestHelp";
+        if (waits) waiting++;
+        arm();
+        let value: unknown;
+        let failure: string | undefined;
         try {
-          if (method === "handBack") return settle({ kind: "handed_back", message: String(args[0] ?? "") });
-          if (method === "readings") return reply(id, calls.readings());
-          waiting = method === "ask" || method === "requestHelp";
-          arm();
-          const value =
+          value =
             method === "act"
               ? await calls.act(args[0])
-              : method === "ask"
-                ? await calls.ask(String(args[0]), String(args[1]))
-                : method === "requestHelp"
-                  ? await calls.requestHelp(String(args[0]), String(args[1]))
-                  : undefined;
-          if (settled) return;
-          waiting = false;
-          arm();
-          reply(id, value);
+              : method === "readings"
+                ? calls.readings()
+                : method === "ask"
+                  ? await calls.ask(String(args[0]), String(args[1]))
+                  : method === "requestHelp"
+                    ? await calls.requestHelp(String(args[0]), String(args[1]))
+                    : undefined;
         } catch (error) {
-          if (settled) return;
-          waiting = false;
-          arm();
-          reply(id, undefined, error instanceof Error ? error.message : String(error));
+          failure = error instanceof Error ? error.message : String(error);
         }
+        if (waits) waiting--;
+        if (settled) return;
+        arm();
+        reply(id, value, failure);
       };
       arm();
-      port.postMessage({ type: "start", source: workerSource, code, cycle });
+      port.postMessage({ type: "start", source: workerSource, code, cycle, run });
     });
   }
 

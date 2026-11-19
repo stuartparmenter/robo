@@ -40,7 +40,14 @@ export const toolInputs = {
   get_work_instruction: z.object({}),
   observe: z.object({ camera }),
   act: z.object({ id, command, camera: reportCamera }),
-  finish: z.object({ id, camera: reportCamera }),
+  finish: z.object({
+    id,
+    camera: reportCamera,
+    reject_reason: z
+      .enum(["oversize", "left_hand", "other"])
+      .optional()
+      .describe("Work cell: why the part went to the reject bin."),
+  }),
   request_help: z.object({
     id,
     category: helpCategory.describe("What you believe is wrong."),
@@ -68,6 +75,7 @@ export const toolInputs = {
       .default(5)
       .describe("Wait up to this long for the routine to change state."),
     answer: z.string().max(600).optional().describe("Answer to a question the routine asked with robot.ask."),
+    question_id: z.number().int().optional().describe("The question_id of the question you are answering."),
     stop: z.boolean().optional().describe("Stop the routine. Control returns to you mid-cycle."),
   }),
 };

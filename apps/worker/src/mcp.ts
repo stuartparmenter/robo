@@ -66,7 +66,7 @@ export function serveMcp(
       "finish",
       {
         description:
-          "Declare the attempt complete. The simulator scores the result. In a work cell shift this ends the current cycle and starts the next.",
+          "Declare the attempt complete. The simulator scores the result. In a work cell shift this presses cycle start and ends the current cycle; the machine may refuse to start, and then the cycle continues.",
         inputSchema: toolInputs.finish.extend(game),
       },
       ({ game_id, ...args }) => call(game_id, { tool: "finish", ...args }),
@@ -101,7 +101,7 @@ export function serveMcp(
       "routine_status",
       {
         description:
-          "Work cell shift: wait for the running routine to change state, answer its question, or stop it.",
+          "Work cell shift: wait for the running routine to change state, answer its question (pass its question_id), or stop it.",
         inputSchema: toolInputs.routine_status.extend(game),
       },
       ({ game_id, ...args }) => call(game_id, { tool: "routine_status", ...args }),

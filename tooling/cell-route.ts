@@ -1,5 +1,5 @@
 import { revisions } from "../apps/worker/sim/cell";
-import type { Simulation } from "../apps/worker/sim/physics";
+import type { RejectReason, Simulation } from "../apps/worker/sim/physics";
 import type { Command } from "../apps/worker/src/protocol";
 
 const mm = (value: number) => Math.round(value * 10000) / 10;
@@ -28,7 +28,17 @@ function graspYaw(yaw: number) {
  * Reference route for one cycle using exact simulator state. It proves each condition is
  * solvable and gives an upper bound on moves. It is not available to the agent.
  */
-export function referenceCycle(sim: Simulation, options: { loadDefects?: boolean } = {}) {
+export type ReferenceOptions = {
+  /** Load nonconforming parts instead of rejecting them. */
+  loadDefects?: boolean;
+  /** Stop before closing the cover, without pressing cycle start. */
+  leaveCoverOpen?: boolean;
+  rejectReason?: RejectReason;
+  /** Set the back stop this far off its marks, in metres. */
+  stopOffset?: number;
+};
+
+export function referenceCycle(sim: Simulation, options: ReferenceOptions = {}) {
   const cell = sim.cellGeometry;
   const spec = sim.cycleSpec;
   if (!cell || !spec) throw new Error("Not a work cell run.");
@@ -63,7 +73,9 @@ export function referenceCycle(sim: Simulation, options: { loadDefects?: boolean
     goto(cell.bin.x, cell.bin.y, 32);
     act(openTo());
     act(move(cell.bin.x, cell.bin.y, safeZ));
-    sim.finish();
+    sim.finish({
+      reject_reason: options.rejectReason ?? (spec.condition === "oversize" ? "oversize" : "left_hand"),
+    });
     return;
   }
 
@@ -82,7 +94,7 @@ export function referenceCycle(sim: Simulation, options: { loadDefects?: boolean
     act(openTo());
   }
 
-  const target = loadY + revisions[spec.revision].stop;
+  const target = loadY + revisions[spec.revision].stop + (options.stopOffset ?? 0);
   const face = truth().stopFace ?? target;
   if (Math.abs(face - target) > 0.0007) {
     // The knob's centre is 10 mm behind the stop face. Turned 90°, the wrist clears the latch.
@@ -120,13 +132,28 @@ export function referenceCycle(sim: Simulation, options: { loadDefects?: boolean
   const loadAt = stop - spec.length / 2 - 0.0003;
   goto(loadX, loadAt, 23);
   act(openTo(26));
+  if (options.leaveCoverOpen) {
+    act(move(loadX, loadAt, safeZ));
+    return;
+  }
+  closeCover(sim);
+  sim.finish();
+}
 
-  goto(parked, loadY, 118, 90);
+/** Slide the parked cover shut by its handle and lift clear. */
+export function closeCover(sim: Simulation) {
+  const cell = sim.cellGeometry;
+  if (!cell) throw new Error("Not a work cell run.");
+  const act = (command: Command) => sim.act(command);
+  const { loadX, loadY, direction, coverTravel } = cell;
+  const parked = loadX + coverTravel * direction;
+  const r = sim.readings();
+  if (r.z_mm < safeZ - 10) act(move(r.x_mm / 1000, r.y_mm / 1000, safeZ, r.yaw_deg));
+  act(move(parked, loadY, safeZ, 90));
   act(openTo());
   act(move(parked, loadY, 118, 90));
   act(close);
   act(move(loadX, loadY, 118, 90));
   act(openTo());
   act(move(loadX, loadY, safeZ, 90));
-  sim.finish();
 }

@@ -169,6 +169,8 @@ export class FieldView {
   private applyPose({ pos, mat }: FieldPose) {
     for (const [i, mesh] of this.meshes.entries()) {
       mesh.position.fromArray(pos, i * 3);
+      // The work cell parks unused bodies (the chip, a quarantined part) under the table.
+      mesh.visible = pos[i * 3 + 2] > -0.1;
       // MuJoCo matrices are row-major and Three.js reads column-major.
       this.rotation.setFromMatrix3(this.rotation3.fromArray(mat, i * 9).transpose());
       mesh.quaternion.setFromRotationMatrix(this.rotation);
