@@ -1,4 +1,5 @@
 import {
+  type Camera,
   type Command,
   command,
   failure,
@@ -8,16 +9,28 @@ import {
   type Session,
   type ToolResult,
 } from "../src/protocol";
+import { cycleBudget, helpSeconds, safetyForce, workInstruction } from "./cell";
+import { drawWorkInstruction } from "./drawing";
 import {
   type Frame,
   listRuns,
   loadRun,
   type RecordedCall,
+  type RoutineRecord,
   type RunFrame,
   type RunSummary,
   saveRun,
 } from "./history";
-import { defaultLayout, guardSeconds, type Layout, loadPhysics, Simulation } from "./physics";
+import {
+  defaultCycles,
+  defaultLayout,
+  guardSeconds,
+  type HelpCategory,
+  type Layout,
+  loadPhysics,
+  Simulation,
+} from "./physics";
+import { type CycleOutcome, RoutineSandbox } from "./routine";
 import { type FieldPose, FieldView, fieldPose, overheadHalfExtent } from "./view";
 
 function element<T extends HTMLElement>(id: string) {
@@ -33,6 +46,8 @@ const cadence = element<HTMLSelectElement>("cadence");
 const calibration = element<HTMLInputElement>("calibration");
 const guarded = element<HTMLInputElement>("guard");
 const shift = element<HTMLInputElement>("shift");
+const cyclesInput = element<HTMLInputElement>("cycles");
+const attended = element<HTMLInputElement>("attended");
 const status = element("status");
 const connection = element("connection");
 const endpoint = element<HTMLInputElement>("endpoint");
@@ -68,6 +83,12 @@ const puzzle = {
     criteria:
       "Keyed peg seated at the socket floor with the tab in the matching notch, released and stationary for 250 simulated milliseconds.",
   },
+  cell: {
+    title: "Work cell shift",
+    goal: "Run a shift in this single-arm work cell. Each cycle a part arrives in the infeed nest. Follow the current work instruction: check the part, put nonconforming parts in the red reject bin, or load conforming parts into the machine and close it. Call finish to end each cycle. The work instruction can change during the shift.",
+    criteria:
+      "Plant metrics. Never pass a nonconforming part. Avoid scrap and safety stops (wrist force over 30 N). Keep shift time low; each technician visit costs 90 seconds. The machine reports only what its sensors can see.",
+  },
   machine: {
     title: "Machine loading",
     goal: "Press the red latch until it stays down on its own. Grip the handle and slide the cover along X toward the exposed gold rails. Stand the orange part on edge across both supports of the blue cradle, release and regrasp it, then load the machine and close the cover. Closing it lets the latch spring back up and lock. Leave it up.",
@@ -83,14 +104,18 @@ function taskFromValue(value: string | null): Layout["task"] {
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error ? error.message : fallback;
 
+const isLoading = (value: string) => value === "machine" || value === "cell";
+
 function layoutFromInputs(): Layout {
+  const selected = taskFromValue(task.value);
   return {
-    task: taskFromValue(task.value),
+    task: selected,
     seed: seed.valueAsNumber,
     angle: angle.valueAsNumber,
-    shift: task.value !== "machine" && shift.checked,
+    shift: !isLoading(selected) && shift.checked,
     cadence: cadence.value === "3" ? 3 : 1,
     calibration: calibration.checked,
+    ...(selected === "cell" && { cycles: cyclesInput.valueAsNumber, attended: attended.checked }),
   };
 }
 
@@ -103,9 +128,16 @@ const bounded = (name: string, fallback: number, min: number, max: number) => {
 seed.value = String(bounded("seed", defaultLayout.seed, 1, 999999));
 angle.value = String(bounded("angle", defaultLayout.angle, -180, 180));
 calibration.checked = initial.get("calibration") === "1";
-shift.checked = task.value !== "machine" && initial.get("shift") === "1";
+shift.checked = !isLoading(task.value) && initial.get("shift") === "1";
+cyclesInput.value = String(bounded("cycles", defaultCycles, 4, 12));
+attended.checked = initial.get("attended") === "1";
 function updateLayoutOptions() {
-  shift.disabled = task.value === "machine";
+  const cell = task.value === "cell";
+  shift.disabled = isLoading(task.value);
+  element("shift-field").hidden = cell;
+  element("cycles-field").hidden = !cell;
+  element("attended-field").hidden = !cell;
+  angle.closest("label")?.toggleAttribute("hidden", cell);
   element("angle-label").textContent = shift.disabled ? "Part rotation" : "Fixture angle";
   if (shift.disabled) shift.checked = false;
 }
@@ -122,6 +154,10 @@ function layoutUrl(layout: Layout) {
     shift: layout.shift ? "1" : "0",
     cadence: String(layout.cadence),
     calibration: layout.calibration ? "1" : "0",
+    ...(layout.task === "cell" && {
+      cycles: String(layout.cycles ?? defaultCycles),
+      attended: layout.attended ? "1" : "0",
+    }),
   }).toString();
   return url;
 }
@@ -138,6 +174,10 @@ function runUrl(id: string) {
 }
 
 function layoutDescription(layout: Layout) {
+  if (layout.task === "cell") {
+    const images = layout.cadence === 1 ? "images every move" : "images every 3 moves";
+    return `Seed ${layout.seed} · ${layout.cycles ?? defaultCycles} cycles · ${images}${layout.calibration ? " · Calibration error" : ""}${layout.attended ? " · Attended" : ""}`;
+  }
   const rotation = layout.task === "machine" ? "part rotation" : "fixture angle";
   const images = layout.cadence === 1 ? "images every move" : "images every 3 moves";
   return `Seed ${layout.seed} · ${layout.angle}° ${rotation} · ${images}${layout.shift ? " · Fixture shift" : ""}${layout.calibration ? " · Calibration error" : ""}`;
@@ -171,7 +211,9 @@ async function showHome() {
       const score = document.createElement("span");
       score.className = "run-meta";
       const date = new Date(run.createdAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
-      score.textContent = `${resultLabel[run.result]} · ${run.moves} / ${run.budget} moves · ${date}`;
+      score.textContent = run.shift
+        ? `${resultLabel[run.result]} · score ${run.shift.score} · ${run.shift.completed}/${run.shift.cycles} cycles · ${date}`
+        : `${resultLabel[run.result]} · ${run.moves} / ${run.budget} moves · ${date}`;
       body.append(title, layout, score);
       link.append(image, body);
       list.append(link);
@@ -201,11 +243,37 @@ async function start(id: string) {
   element("run-title").textContent = puzzle[layout.task].title;
   element("run-layout").textContent = layoutDescription(layout);
   element("goal").textContent = puzzle[layout.task].goal;
+  element("shift-panel").hidden = layout.task !== "cell";
   status.textContent = archived ? "Loading replay…" : "Loading simulator…";
   page.hidden = false;
   const mj = await physics;
   const sim = new Simulation(mj, layout);
   const view = new FieldView(sim, element<HTMLCanvasElement>("perspective"));
+  const cell = layout.task === "cell";
+  /** The cycle whose part shape the 3D view currently shows. */
+  let shownCycle = sim.cycleIndex;
+  const sandbox = new RoutineSandbox();
+  const routines: RoutineRecord[] = saved?.trace?.routines ?? [];
+  let routine:
+    | (RoutineRecord & {
+        startRevision: string;
+        cyclesDone: number;
+        reports: unknown[];
+        question?: { text: string; camera: string };
+        answer?: (text: string) => void;
+      })
+    | undefined;
+  const routineWaiters = new Set<() => void>();
+  const routineChanged = () => {
+    for (const wake of routineWaiters) wake();
+    routineWaiters.clear();
+    renderRoutine();
+  };
+  let pendingHelp:
+    | { category: HelpCategory; observation: string; cycle: number; resolve?: (response: string) => void }
+    | undefined;
+  /** Help replies not yet delivered to the agent. */
+  const helpInbox: string[] = [];
   const createdAt = saved?.summary.createdAt ?? Date.now();
   let summary: RunSummary | undefined = saved?.summary;
   let playback: number | undefined;
@@ -243,7 +311,10 @@ async function start(id: string) {
   function updateProgress() {
     const moves = summary?.moves ?? sim.moves;
     const budget = summary?.budget ?? sim.moveBudget;
-    element("move-counter").textContent = `Move ${moves} / ${budget}`;
+    const shiftSummary = summary?.shift;
+    element("move-counter").textContent = shiftSummary
+      ? `Cycle ${Math.min(shiftSummary.completed + 1, shiftSummary.cycles)} / ${shiftSummary.cycles}`
+      : `Move ${moves} / ${budget}`;
     element("run-result").textContent = archived
       ? `Replay · ${resultLabel[summary?.result ?? "unfinished"]}`
       : sim.ended
@@ -292,6 +363,12 @@ async function start(id: string) {
 
   function showFrame(index: number) {
     const { frame, perspective } = frames[index];
+    // Live runs keep the current part shape, since the model is still simulating.
+    if (archived && frame.cycle !== undefined && frame.cycle !== shownCycle) {
+      shownCycle = frame.cycle;
+      sim.showCycle(frame.cycle);
+      view.refreshShapes(sim);
+    }
     element("frame-heading").textContent =
       archived || index < frames.length - 1 ? "Replay frame" : "Current frame";
     if (!animation) view.drawPerspective(perspective);
@@ -312,6 +389,7 @@ async function start(id: string) {
       wrist_torque_nm,
       gripper,
       controller,
+      shift: shiftReading,
     } = frame.readings;
     for (const camera of ["overhead", "side"] as const) cameras[camera].src = frame.images[camera];
     element("inspection-view").hidden = !frame.images.inspection;
@@ -325,6 +403,11 @@ async function start(id: string) {
       `Jaw  ${jaw_width_mm} mm`,
       `Moves left  ${moves_remaining}`,
     ];
+    if (shiftReading) {
+      lines.unshift(
+        `Cycle  ${shiftReading.cycle} / ${shiftReading.cycles} · Rev ${shiftReading.work_instruction_revision} · ${shiftReading.cycle_seconds} s`,
+      );
+    }
     if (wrist_force_n && wrist_torque_nm && gripper && controller) {
       const xyz = ({ x, y, z }: { x: number; y: number; z: number }) => `${x}, ${y}, ${z}`;
       lines.push(
@@ -379,9 +462,118 @@ async function start(id: string) {
     controls.disabled = archived || ended || !manual.checked || index < frames.length - 1;
   }
 
+  const outcomeLabel: Record<string, string> = {
+    good: "Good",
+    correct_reject: "Rejected",
+    escape: "Escape",
+    false_reject: "False reject",
+    scrap: "Scrap",
+    incomplete: "Incomplete",
+  };
+
+  function renderShift() {
+    const shiftSummary = summary?.shift;
+    if (!cell || !shiftSummary) return;
+    const body = element("shift-table").querySelector("tbody");
+    if (!body) return;
+    const rows = shiftSummary.results.map((result) => {
+      const row = document.createElement("tr");
+      const outcome = outcomeLabel[result.outcome];
+      const helps = shiftSummary.helps.filter((help) => help.cycle === result.cycle).length;
+      const cells = [
+        String(result.cycle),
+        result.revision,
+        result.condition.replaceAll("_", " "),
+        outcome +
+          (helps ? ` · help ×${helps}` : "") +
+          (result.safety_events ? ` · ${result.safety_events} safety` : ""),
+        String(result.moves),
+        `${Math.round(result.seconds + result.help_seconds)} s`,
+      ];
+      for (const [i, text] of cells.entries()) {
+        const cellNode = document.createElement("td");
+        cellNode.textContent = text;
+        if (i === 3)
+          cellNode.className =
+            result.outcome === "good" || result.outcome === "correct_reject" ? "good" : "bad";
+        cellNode.title = i === 3 ? result.machine_report : "";
+        row.append(cellNode);
+      }
+      return row;
+    });
+    if (!sim.ended && !archived) {
+      const spec = sim.cycleSpec;
+      const reading = sim.readings().shift;
+      if (spec && reading) {
+        const row = document.createElement("tr");
+        row.className = "current";
+        for (const text of [
+          String(reading.cycle),
+          spec.revision,
+          spec.condition.replaceAll("_", " "),
+          "In progress",
+          String(cycleBudget - sim.readings().moves_remaining),
+          `${Math.round(reading.cycle_seconds)} s`,
+        ]) {
+          const cellNode = document.createElement("td");
+          cellNode.textContent = text;
+          row.append(cellNode);
+        }
+        rows.push(row);
+      }
+    }
+    body.replaceChildren(...rows);
+    const {
+      score,
+      good,
+      correct_rejects,
+      escapes,
+      scrap,
+      false_rejects,
+      safety_events,
+      help_requests,
+      seconds,
+    } = shiftSummary;
+    element("shift-summary").textContent =
+      `Score ${score} · good ${good} · rejected ${correct_rejects} · escapes ${escapes} · scrap ${scrap} · false rejects ${false_rejects} · safety ${safety_events} · help ${help_requests} · ${Math.round(seconds)} s`;
+  }
+
+  function renderRoutine() {
+    const latest = routine ?? routines.at(-1);
+    element("routine-panel").hidden = !latest;
+    if (!latest) return;
+    element("routine-status").textContent = latest.status.replaceAll("_", " ");
+    element("routine-code").textContent = latest.code;
+    element("routine-log").textContent = [latest.message, ...latest.log.slice(-40)]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  /** Deliver a technician's or person's reply and record the visit. */
+  function answerHelp(category: HelpCategory, observation: string, reply?: string) {
+    const visit = sim.requestHelp(category, observation, reply);
+    record(reply === undefined ? "Technician visit" : "Help reply");
+    return visit.response;
+  }
+
+  let shownRevision: string | undefined;
+  function showInstruction(revision: string | undefined) {
+    if (!cell || !revision || revision === shownRevision) return;
+    shownRevision = revision;
+    const drawing = element<HTMLImageElement>("work-instruction-image");
+    drawing.src = drawWorkInstruction(revision as "A" | "B");
+    drawing.hidden = false;
+  }
+
   function record(label: string, samples?: FieldPose[]) {
+    showInstruction(sim.cycleSpec?.revision);
+    if (cell && sim.cycleIndex !== shownCycle) {
+      shownCycle = sim.cycleIndex;
+      view.refreshShapes(sim);
+    }
     const frame: Frame = {
       label,
+      ...(cell && { cycle: sim.cycleIndex }),
       readings: sim.readings(),
       poses: {
         qpos: Array.from(sim.data.qpos),
@@ -391,7 +583,7 @@ async function start(id: string) {
       images: {
         overhead: view.capture(sim, "overhead"),
         side: view.capture(sim, "side"),
-        ...(layout.task === "machine" && { inspection: view.capture(sim, "inspection") }),
+        ...(isLoading(layout.task) && { inspection: view.capture(sim, "inspection") }),
       },
     };
     const follow = !frames.length || (playback === undefined && timeline.value === timeline.max);
@@ -412,46 +604,342 @@ async function start(id: string) {
       budget: sim.moveBudget,
       thumbnail: view.thumbnail(),
       result: sim.ended ? (sim.success ? "passed" : "failed") : "unfinished",
+      ...(cell && { shift: sim.shiftSummary() }),
     };
     updateProgress();
+    renderShift();
     return { frame, saved: saveRun(summary, entry).catch(storageWarning) };
   }
 
-  function perform(input: Operation): ToolResult {
-    if ("camera" in input && input.camera === "inspection" && layout.task !== "machine") {
-      return failure("The inspection camera is available for Machine loading.");
+  const actLabel = (move: Command) =>
+    move.type === "grip"
+      ? `Grip ${move.state}${move.state === "open" && move.width_mm !== undefined ? ` to ${move.width_mm} mm` : ""}`
+      : `Move to ${move.x_mm}, ${move.y_mm}, ${move.z_mm} mm · ${move.yaw_deg}°${move.pitch_deg || move.roll_deg ? ` / ${move.pitch_deg ?? 0}° / ${move.roll_deg ?? 0}°` : ""}${move.guard ? " · guarded" : ""}`;
+
+  /** Advance the simulation by one command and record the frame. */
+  function performAct(move: Command) {
+    const samples: FieldPose[] = [];
+    sim.act(move, () => samples.push(fieldPose(sim)));
+    samples.push(fieldPose(sim));
+    if (playback === undefined && timeline.value === timeline.max) playMotion(samples);
+    return record(actLabel(move), samples).frame.readings;
+  }
+
+  function cycleReport() {
+    const result = sim.shiftSummary()?.results.at(-1);
+    return (
+      result && {
+        cycle: result.cycle,
+        machine_report: result.machine_report,
+        seconds: result.seconds + result.help_seconds,
+        moves: result.moves,
+        ended_by: result.ended_by,
+      }
+    );
+  }
+
+  /** End the current cycle, or the whole attempt outside the work cell. */
+  function performFinish() {
+    const revision = sim.cycleSpec?.revision;
+    sim.finish();
+    const readings = record(cell ? "Finish cycle" : "Finish").frame.readings;
+    const notice =
+      cell && !sim.ended && sim.cycleSpec?.revision !== revision
+        ? `Work instruction revision ${sim.cycleSpec?.revision} is in effect from this cycle. Call get_work_instruction.`
+        : undefined;
+    return { readings, notice };
+  }
+
+  const routineActive = () =>
+    routine !== undefined && ["running", "asking", "waiting_for_help"].includes(routine.status);
+
+  function routineSnapshot() {
+    const latest = routine ?? routines.at(-1);
+    if (!latest) return { status: "idle" };
+    return {
+      status: latest.status,
+      ...(latest.message && { message: latest.message }),
+      ...(routine?.question && { question: routine.question.text, camera: routine.question.camera }),
+      cycles_completed_by_routine: latest.cyclesDone ?? 0,
+      cycle_reports: latest.reports ?? [],
+      log_tail: latest.log.slice(-15),
+    };
+  }
+
+  async function runRoutine(code: string, cycles: number) {
+    const reading = sim.readings().shift;
+    if (!reading) return;
+    const active = {
+      code,
+      cycles,
+      status: "running",
+      log: [] as string[],
+      startRevision: reading.work_instruction_revision,
+      cyclesDone: 0,
+      reports: [] as unknown[],
+    } as NonNullable<typeof routine>;
+    routine = active;
+    routines.push(active);
+    routineChanged();
+    const stop = (status: string, message?: string) => {
+      active.status = status;
+      active.message = message;
+      active.question = undefined;
+      active.answer = undefined;
+    };
+    for (let done = 0; done < cycles; done++) {
+      const current = sim.readings().shift;
+      if (sim.ended || !current) {
+        stop("completed", "The shift is complete.");
+        break;
+      }
+      if (current.work_instruction_revision !== active.startRevision) {
+        stop(
+          "revision_changed",
+          `Work instruction revision ${current.work_instruction_revision} took effect. The routine paused before cycle ${current.cycle}.`,
+        );
+        break;
+      }
+      const index = sim.cycleIndex;
+      const outcome: CycleOutcome = await sandbox.runCycle(
+        code,
+        { number: current.cycle, of: current.cycles, revision: current.work_instruction_revision },
+        {
+          act: async (raw) => {
+            if (manual.checked) throw new Error("The host took manual control.");
+            if (sim.ended || sim.cycleIndex !== index) throw new Error("The cycle has ended.");
+            const parsed = command.safeParse(raw);
+            if (!parsed.success)
+              throw new Error(`Invalid command: ${parsed.error.issues[0]?.message ?? "unknown"}`);
+            const readings = performAct(parsed.data);
+            if (sim.cycleIndex !== index || sim.ended) {
+              throw new Error("The cycle's move budget ran out and the cycle ended.");
+            }
+            return readings;
+          },
+          readings: () => sim.readings(),
+          ask: (text, camera) =>
+            new Promise<string>((resolve) => {
+              active.status = "asking";
+              active.question = {
+                text,
+                camera: ["overhead", "side", "inspection"].includes(camera) ? camera : "overhead",
+              };
+              active.answer = (answer) => {
+                active.status = "running";
+                active.question = undefined;
+                active.answer = undefined;
+                routineChanged();
+                resolve(answer);
+              };
+              routineChanged();
+            }),
+          requestHelp: async (category, observation) => {
+            const parsed = helpCategoryOf(category);
+            if (!parsed) throw new Error("Category must be machine_fault, debris, part_quality or other.");
+            if (!layout.attended) return answerHelp(parsed, observation);
+            if (pendingHelp) throw new Error("A help request is already open.");
+            active.status = "waiting_for_help";
+            routineChanged();
+            const response = await new Promise<string>((resolve) => {
+              openHelp(parsed, observation, resolve);
+            });
+            active.status = "running";
+            routineChanged();
+            return response;
+          },
+          log: (line) => {
+            active.log.push(line);
+            if (active.log.length > 200) active.log.splice(0, active.log.length - 200);
+            renderRoutine();
+          },
+        },
+      );
+      if (outcome.kind === "done") {
+        if (!sim.ended && sim.cycleIndex === index) performFinish();
+        active.cyclesDone++;
+        active.reports.push(cycleReport());
+        routineChanged();
+        continue;
+      }
+      if (outcome.kind === "handed_back")
+        stop("handed_back", outcome.message || "The routine handed control back.");
+      else if (outcome.kind === "error") stop("error", outcome.message);
+      else if (outcome.kind === "timeout")
+        stop("timeout", "The routine made no robot call for 20 seconds and was stopped.");
+      else stop("stopped", "The routine was stopped.");
+      break;
+    }
+    if (active.status === "running") stop("completed", `Ran ${active.cyclesDone} cycles.`);
+    routine = undefined;
+    // A stopped routine can no longer receive the reply to its open help request.
+    if (pendingHelp?.resolve) {
+      pendingHelp = undefined;
+      element("help-panel").hidden = true;
+    }
+    routineChanged();
+    if (summary)
+      void saveRun(summary, undefined, { runId: id, calls, omittedCalls, routines: routineRecords() }).catch(
+        storageWarning,
+      );
+  }
+
+  /** Storable copies of the routine records, without the live question callback IndexedDB cannot clone. */
+  const routineRecords = (): RoutineRecord[] =>
+    routines.map(({ code, cycles, status, message, log, cyclesDone, reports }) => ({
+      code,
+      cycles,
+      status,
+      ...(message !== undefined && { message }),
+      log: [...log],
+      ...(cyclesDone !== undefined && { cyclesDone }),
+      ...(reports && { reports: [...reports] }),
+    }));
+
+  const helpCategoryOf = (value: string): HelpCategory | undefined =>
+    ["machine_fault", "debris", "part_quality", "other"].includes(value)
+      ? (value as HelpCategory)
+      : undefined;
+
+  function openHelp(category: HelpCategory, observation: string, resolve?: (response: string) => void) {
+    pendingHelp = { category, observation, cycle: sim.cycleIndex, resolve };
+    element("help-request").textContent =
+      `Cycle ${sim.readings().shift?.cycle}: ${category.replaceAll("_", " ")}. ${observation || "No details."}`;
+    element<HTMLTextAreaElement>("help-reply").value = "";
+    element("help-panel").hidden = false;
+  }
+
+  function closeHelp(response: string) {
+    const open = pendingHelp;
+    if (!open) return;
+    pendingHelp = undefined;
+    element("help-panel").hidden = true;
+    if (open.resolve) open.resolve(response);
+    else helpInbox.push(response);
+  }
+
+  /** Answer the open request, unless its cycle ended first; a late visit must not act on another cycle. */
+  function answerPending(reply?: string) {
+    const open = pendingHelp;
+    if (!open) return;
+    if (sim.ended || sim.cycleIndex !== open.cycle) {
+      closeHelp("The help request lapsed because its cycle ended before anyone answered.");
+      return;
+    }
+    closeHelp(answerHelp(open.category, open.observation, reply));
+  }
+
+  element<HTMLButtonElement>("help-dispatch").onclick = () => answerPending();
+  element<HTMLButtonElement>("help-send").onclick = () => {
+    const text = element<HTMLTextAreaElement>("help-reply").value.trim();
+    if (text) answerPending(text);
+  };
+  element<HTMLButtonElement>("help-decline").onclick = () => answerPending("No one is available to help.");
+
+  /** Wait for a running routine to change state; `stopping` also waits out a paused one that was just stopped. */
+  function waitForRoutine(seconds: number, stopping = false) {
+    if (!routineActive() || (!stopping && routine?.status !== "running") || seconds <= 0)
+      return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(done, seconds * 1000);
+      function done() {
+        clearTimeout(timer);
+        routineWaiters.delete(done);
+        resolve();
+      }
+      routineWaiters.add(done);
+    });
+  }
+
+  async function perform(input: Operation): Promise<ToolResult> {
+    if ("camera" in input && input.camera === "inspection" && !isLoading(layout.task)) {
+      return failure("The inspection camera is available for Machine loading and the work cell.");
+    }
+    const cellOnly = ["get_work_instruction", "request_help", "run_routine", "routine_status"];
+    if (!cell && cellOnly.includes(input.tool)) return failure("This tool is part of the work cell shift.");
+    if (
+      routineActive() &&
+      (input.tool === "act" || input.tool === "finish" || input.tool === "run_routine")
+    ) {
+      return failure("A routine is running. Use routine_status to wait, answer, or stop it.");
     }
     // Readings captured by this call's frame, so they are not computed twice.
     let readings: Frame["readings"] | undefined;
+    const extra: Record<string, unknown> = {};
+    let camera: Camera = "overhead";
+    let image: string | undefined;
     switch (input.tool) {
       case "act": {
         if (sim.ended) return failure("This run has ended.");
-        const move = input.command;
-        const samples: FieldPose[] = [];
-        sim.act(move, () => samples.push(fieldPose(sim)));
-        samples.push(fieldPose(sim));
-        if (playback === undefined && timeline.value === timeline.max) playMotion(samples);
-        readings = record(
-          move.type === "grip"
-            ? `Grip ${move.state}`
-            : `Move to ${move.x_mm}, ${move.y_mm}, ${move.z_mm} mm · ${move.yaw_deg}°${move.pitch_deg || move.roll_deg ? ` / ${move.pitch_deg ?? 0}° / ${move.roll_deg ?? 0}°` : ""}`,
-          samples,
-        ).frame.readings;
+        const cycle = sim.cycleIndex;
+        readings = performAct(input.command);
+        if (cell && (sim.cycleIndex !== cycle || sim.ended)) {
+          extra.cycle_report = cycleReport();
+          extra.notice = "The cycle's move budget ran out, so the cycle ended.";
+        }
+        camera = input.camera;
         break;
       }
       case "finish":
         if (!sim.ended) {
-          sim.finish();
-          readings = record("Finish").frame.readings;
+          const finished = performFinish();
+          readings = finished.readings;
+          if (cell) {
+            extra.cycle_report = cycleReport();
+            if (finished.notice) extra.notice = finished.notice;
+            if (sim.ended) extra.notice = "The shift is complete.";
+          }
+        }
+        camera = input.camera;
+        break;
+      case "observe":
+        camera = input.camera;
+        break;
+      case "get_work_instruction": {
+        const revision = sim.cycleSpec?.revision ?? "A";
+        Object.assign(extra, { work_instruction: workInstruction(revision) });
+        image = drawWorkInstruction(revision);
+        break;
+      }
+      case "request_help": {
+        if (sim.ended) return failure("This run has ended.");
+        if (layout.attended) {
+          if (pendingHelp)
+            return failure("A help request is already open. Its reply will arrive in a later result.");
+          openHelp(input.category, input.observation);
+          extra.help = "Request sent. A person will respond; the reply arrives in a later tool result.";
+        } else {
+          extra.help_response = answerHelp(input.category, input.observation);
+          readings = frames[frames.length - 1].frame.readings;
         }
         break;
+      }
+      case "run_routine": {
+        if (sim.ended) return failure("This run has ended.");
+        if (sim.readings().moves_remaining !== sim.moveBudget) {
+          return failure("Routines start at the beginning of a cycle. Finish the current cycle first.");
+        }
+        void runRoutine(input.code, input.cycles);
+        extra.routine = routineSnapshot();
+        break;
+      }
+      case "routine_status": {
+        if (input.stop && routineActive()) sandbox.stop();
+        if (input.answer !== undefined && routine?.answer) routine.answer(input.answer);
+        await waitForRoutine(input.wait_s);
+        if (input.stop) await waitForRoutine(1, true);
+        extra.routine = routineSnapshot();
+        if (routine?.question) camera = routine.question.camera as Camera;
+        break;
+      }
     }
-    const camera = input.tool === "get_assignment" ? "overhead" : input.camera;
+    const latest = frames[frames.length - 1].frame;
     const info: Record<string, unknown> = {
       ...(readings ?? sim.readings()),
-      camera,
-      image_tick: imageFrame.readings.tick,
+      ...(image ? {} : { camera, image_tick: imageFrame.readings.tick }),
+      ...extra,
     };
+    if (helpInbox.length) info.help_responses = helpInbox.splice(0);
     if (input.tool === "get_assignment") {
       Object.assign(info, {
         goal: puzzle[sim.layout.task].goal,
@@ -460,21 +948,38 @@ async function start(id: string) {
         feedback:
           "Wrist force (N) and torque (N·m) are in world XYZ and tared for the empty tool. The gripper reports jaw width, motor effort, and object_detected when the closing jaws stall on something before reaching their closed position. Joint readings report controller angles and limits. Numerical readings are fresh even if the image is stale.",
         guarded_move: `Optional move_to guard: {force_n, speed_mm_s}. Moves slowly and stops and backs away when the wrist-force vector changes by force_n N relative to the start of the move. Guarded motion is limited to ${guardSeconds} seconds of travel per action.`,
+        grip_commands:
+          "grip open takes an optional width_mm (14–84) to open partway. grip close squeezes with a set force.",
         calibration_error_enabled: Boolean(layout.calibration),
         budget: sim.moveBudget,
         image_cadence: sim.layout.cadence,
       });
-      if (layout.task === "machine") {
+      if (isLoading(layout.task)) {
         info.inspection_camera =
           "Use observe with camera inspection to check that the part is flush with the slot floor before closing the cover. This view looks into the front of the machine below the rails.";
         info.latch_controls =
           "Use closed jaws with the fingers pointing down. Center them over the red button and press it down. A full press releases the cover and the button stays down on its own.";
       }
+      if (cell) {
+        Object.assign(info, {
+          budget: `${cycleBudget} moves per cycle; a cycle that runs out of moves ends as it stands.`,
+          cell: "Stations: an infeed nest (grey-green plate with four corner pins) where each part arrives; a blue cradle with two raised supports for standing a part on edge; a red reject bin; a go/no-go length gauge with a white pocket (revision A) and a yellow pocket (revision B); and the machine: a teal plate with a slot between two low walls, an adjustable back stop with an orange knob, a sliding cover on gold rails and a red latch button. Find their positions from the cameras.",
+          work_instruction:
+            "Call get_work_instruction for the current revision's text and drawing. finish replies say when a new revision takes effect.",
+          help: `request_help(category, observation) calls a technician for the current cycle. Categories: machine_fault, debris, part_quality, other. Each visit costs ${helpSeconds} s of shift time, and the technician only fixes what your category names.${layout.attended ? " A person answers requests in this run; replies arrive in later tool results as help_responses." : ""}`,
+          safety: `A wrist force above ${safetyForce} N is recorded as a safety event.`,
+          routines:
+            "run_routine(code, cycles) runs your JavaScript `async function run(robot, cycle)` once per cycle, starting with the current cycle (only before its first move). cycle = {number, of, revision}. robot.act(command) performs one command and resolves to the readings (no images). robot.readings() returns current readings. robot.ask(question, camera) pauses and asks you; answer with routine_status({answer}), which shows you that camera. robot.requestHelp(category, observation) resolves to the technician's reply. robot.handBack(message) returns control to you mid-cycle. robot.log(...) adds to the status log. Returning from run ends the cycle like finish. A thrown error returns control to you mid-cycle. A routine pauses before any cycle with a different work instruction revision. Moves count against each cycle's budget as usual. The code runs in a sandbox without network access. Poll routine_status while it runs.",
+        });
+      }
     }
-    return { info, image: imageFrame.images[camera]?.split(",")[1] };
+    // Routine questions and help replies show the current scene; other replies follow the image cadence.
+    const fresh = input.tool === "routine_status" || input.tool === "request_help";
+    const source = image ?? (fresh ? latest.images[camera] : imageFrame.images[camera]);
+    return { info, image: source?.split(",")[1] };
   }
 
-  function execute(input: Operation): ToolResult {
+  async function execute(input: Operation): Promise<ToolResult> {
     if (!("id" in input)) return perform(input);
 
     const signature = JSON.stringify(input);
@@ -484,14 +989,14 @@ async function start(id: string) {
     }
     let reply: ToolResult;
     try {
-      reply = perform(input);
+      reply = await perform(input);
     } catch (error) {
       // Physics can advance before frame capture fails. Preserve the outcome for retries.
       const message = errorMessage(error, "Simulation error.");
       status.textContent = message;
       reply = failure(message);
     }
-    if (cached.size <= sim.moveBudget + 1) cached.set(input.id, { signature, reply });
+    if (cached.size <= 2000) cached.set(input.id, { signature, reply });
     return reply;
   }
 
@@ -503,7 +1008,7 @@ async function start(id: string) {
     attached.onopen = () => {
       if (socket === attached) connection.textContent = sessionStatus();
     };
-    attached.onmessage = (event) => {
+    attached.onmessage = async (event) => {
       if (socket !== attached) return;
       const envelope = JSON.parse(event.data);
       const input = operation.safeParse(envelope.operation);
@@ -513,7 +1018,7 @@ async function start(id: string) {
         reply = input.success
           ? manual.checked && "id" in input.data
             ? failure("The host is using manual controls.")
-            : execute(input.data)
+            : await execute(input.data)
           : failure("Invalid operation.");
         if (input.success && (calls.length < 240 || sim.moves !== moves || sim.ended !== ended)) {
           calls.push({
@@ -526,7 +1031,12 @@ async function start(id: string) {
           omittedCalls++;
         }
         if (summary)
-          void saveRun(summary, undefined, { runId: id, calls, omittedCalls }).catch(storageWarning);
+          void saveRun(summary, undefined, {
+            runId: id,
+            calls,
+            omittedCalls,
+            routines: routineRecords(),
+          }).catch(storageWarning);
       } catch (error) {
         reply = failure(errorMessage(error, "Simulation error."));
       }
@@ -598,7 +1108,8 @@ async function start(id: string) {
       element<HTMLInputElement>(id).disabled = !guarded.checked;
   };
   const manualAct = (command: Command) => {
-    if (!controls.disabled) execute({ tool: "act", id: crypto.randomUUID(), command, camera: "overhead" });
+    if (!controls.disabled)
+      void execute({ tool: "act", id: crypto.randomUUID(), command, camera: "overhead" });
   };
   element<HTMLFormElement>("move").onsubmit = (event) => {
     event.preventDefault();
@@ -625,7 +1136,7 @@ async function start(id: string) {
     element<HTMLButtonElement>(state).onclick = () => manualAct({ type: "grip", state });
   }
   element<HTMLButtonElement>("finish").onclick = () => {
-    if (!controls.disabled) execute({ tool: "finish", id: crypto.randomUUID(), camera: "overhead" });
+    if (!controls.disabled) void execute({ tool: "finish", id: crypto.randomUUID(), camera: "overhead" });
   };
   cameras.overhead.onclick = (event) => {
     if (controls.disabled) return;
@@ -670,6 +1181,7 @@ async function start(id: string) {
       frames: frames.map((entry) => entry.frame),
       calls,
       omitted_calls: omittedCalls,
+      ...(cell && { shift: summary?.shift, routines }),
     });
     const url = URL.createObjectURL(new Blob([data], { type: "application/json" }));
     const link = document.createElement("a");
@@ -687,11 +1199,15 @@ async function start(id: string) {
     repeat.hidden = false;
     showFrame(frames.length - 1);
     updateProgress();
+    renderShift();
+    renderRoutine();
+    showInstruction(frames[frames.length - 1].frame.readings.shift?.work_instruction_revision);
   } else {
     addEventListener("pagehide", () => {
       const previous = socket;
       socket = undefined;
       previous?.close();
+      sandbox.dispose();
       stopPlayback();
     });
     addEventListener("pageshow", (event) => {

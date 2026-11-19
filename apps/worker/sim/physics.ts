@@ -1,14 +1,72 @@
 import loadMuJoCo, { type MainModule } from "@mujoco/mujoco";
 import { budget, type Command, type Guard, machineBudget } from "../src/protocol";
+import {
+  type CellGeometry,
+  type CycleSpec,
+  cellFixture,
+  cellGeometry,
+  cellPiece,
+  cycleBudget,
+  helpSeconds,
+  markBars,
+  partThickness,
+  partWidth,
+  revisions,
+  safetyForce,
+  shiftPlan,
+  stopHalfDepth,
+} from "./cell";
 import { machine, machineFixture } from "./machine";
 
 export type Layout = {
-  task: "peg" | "block" | "keyed" | "machine";
+  task: "peg" | "block" | "keyed" | "machine" | "cell";
   seed: number;
   angle: number;
   shift: boolean;
   cadence: 1 | 3;
   calibration?: boolean;
+  /** Work cell shift length. */
+  cycles?: number;
+  /** A person answers help requests instead of the scripted technician. */
+  attended?: boolean;
+};
+
+export const defaultCycles = 8;
+export type HelpCategory = "machine_fault" | "debris" | "part_quality" | "other";
+export type Outcome = "good" | "correct_reject" | "escape" | "false_reject" | "scrap" | "incomplete";
+export const outcomePoints: Record<Outcome, number> = {
+  good: 1,
+  correct_reject: 1,
+  escape: -3,
+  false_reject: 0,
+  scrap: -1,
+  incomplete: 0,
+};
+export type HelpRecord = {
+  cycle: number;
+  category: HelpCategory;
+  observation: string;
+  /** The category matched the cycle's actual condition. */
+  matched: boolean;
+  /** The cycle had a machine fault that only a technician could clear. */
+  required: boolean;
+  /** A technician came, as opposed to a person replying or declining. Only visits are scored. */
+  visit: boolean;
+  response: string;
+};
+export type CycleResult = {
+  cycle: number;
+  revision: "A" | "B";
+  condition: CycleSpec["condition"];
+  outcome: Outcome;
+  /** What the machine's own sensors report to the operator. */
+  machine_report: string;
+  checks?: Record<string, boolean>;
+  moves: number;
+  seconds: number;
+  help_seconds: number;
+  safety_events: number;
+  ended_by: "declared" | "move_budget";
 };
 
 export const defaultLayout: Layout = { task: "peg", seed: 1, angle: 26, shift: false, cadence: 1 };
@@ -27,6 +85,9 @@ const armJoints = 6;
 const gripperJoints = 2;
 /** Actuated joints come first in qpos, qvel and ctrl; the piece's free joint follows. */
 const motorCount = armJoints + gripperJoints;
+/** Finger travel per jaw in metres. Closing targets lie beyond the inner limit. */
+const jawTravel = { min: 0.01, max: 0.047 };
+const closedTarget = 0.007;
 /** Each ramped move or settle advances this many steps after the final target. */
 const settleSteps = 220;
 /** Guarded moves drive in 0.02 s increments and are capped at this much travel time. */
@@ -137,9 +198,10 @@ export function layoutGeometry(layout: Layout) {
   };
 }
 
-function scene(layout: Layout) {
+function scene(layout: Layout, plan?: CycleSpec[]) {
   const { x, y, yaw, socketX, socketY } = layoutGeometry(layout);
-  const loading = layout.task === "machine";
+  const cell = layout.task === "cell";
+  const loading = layout.task === "machine" || cell;
   const peg = layout.task === "peg" || layout.task === "keyed";
   const linkCollision = loading ? 'contype="2" conaffinity="4"' : 'contype="0" conaffinity="0"';
   const keyed = layout.task === "keyed";
@@ -202,7 +264,10 @@ function scene(layout: Layout) {
           </body>
         </body>
       </body>
-      <body name="piece" pos="${x} ${y} ${loading ? 0.011 : 0.001}" euler="0 0 ${yaw}">
+      ${
+        cell && plan
+          ? cellPiece(plan[0])
+          : `<body name="piece" pos="${x} ${y} ${loading ? 0.011 : 0.001}" euler="0 0 ${yaw}">
         <freejoint name="piece_free"/>
         ${peg ? box("shaft", ".018 .012 .020", "0 0 .020", ".97 .62 .23 1", 'mass=".020"') : ""}
         ${peg ? box("band", ".0182 .0122 .003", "0 0 .026", ".99 .88 .57 1", 'mass=".0001" contype="0" conaffinity="0"') : ""}
@@ -213,11 +278,14 @@ function scene(layout: Layout) {
             ? box("workpiece", ".016 .034 .009", "0 0 0", ".98 .49 .21 1", 'mass=".03"')
             : box("shoulder", ".023 .017 .009", peg ? "0 0 .049" : "0 0 .010", ".98 .49 .21 1", 'mass=".025"')
         }
-      </body>
+      </body>`
+      }
       ${
-        loading
-          ? machineFixture(layout.seed)
-          : `
+        cell
+          ? cellFixture(cellGeometry(layout.seed))
+          : loading
+            ? machineFixture(layout.seed)
+            : `
       <body name="fixture_anchor" mocap="true" pos="${socketX} ${socketY} 0" euler="0 0 ${layout.angle}">
         ${keyed ? box("slide_track", ".045 .058 .001", "0 0 .001", ".24 .31 .35 1", 'contype="0" conaffinity="0"') : ""}
         <body name="fixture" gravcomp="1">
@@ -255,6 +323,38 @@ export async function loadPhysics(wasm?: string) {
   return loadMuJoCo(wasm ? { locateFile: () => wasm } : undefined);
 }
 
+type CellState = {
+  geometry: CellGeometry;
+  plan: CycleSpec[];
+  index: number;
+  startTick: number;
+  moves: number;
+  helpSeconds: number;
+  safetyEvents: number;
+  overForce: boolean;
+  quarantined: boolean;
+  fault: CycleSpec["fault"];
+  results: CycleResult[];
+  helps: HelpRecord[];
+  ids: {
+    stopBody: number;
+    debrisBody: number;
+    debrisGeom: number;
+    debrisQ: number;
+    debrisDof: number;
+    coverDof: number;
+    stopDof: number;
+    knob: number;
+    workpiece: number;
+    marks: number[];
+    pieceQ: number;
+    pieceDof: number;
+  };
+  coverFriction: number;
+};
+
+const parkedDebris = [0, 0.3, -0.25];
+
 export class Simulation {
   readonly model;
   readonly data;
@@ -276,6 +376,7 @@ export class Simulation {
   private unlatched = false;
   private latchArmed = true;
   private readonly machinePosition?: { cover: number; latch: number };
+  private readonly cell?: CellState;
   private tracking = false;
   private released = true;
   private stableTicks = 0;
@@ -290,7 +391,8 @@ export class Simulation {
     readonly layout: Layout,
   ) {
     this.bias = positionBias(layout);
-    this.model = mj.MjModel.from_xml_string(scene(layout));
+    const plan = layout.task === "cell" ? shiftPlan(layout.seed, layout.cycles ?? defaultCycles) : undefined;
+    this.model = mj.MjModel.from_xml_string(scene(layout, plan));
     this.data = new mj.MjData(this.model);
     const geom = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_GEOM.value, name);
     const body = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_BODY.value, name);
@@ -306,12 +408,45 @@ export class Simulation {
     this.piece = body("piece");
     this.tool = body("tool");
     this.fixture = body("fixture");
-    if (layout.task === "machine") {
-      const joint = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_JOINT.value, name);
+    const joint = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_JOINT.value, name);
+    if (layout.task === "machine" || layout.task === "cell") {
       this.machinePosition = {
         cover: this.model.jnt_qposadr[joint("cover_slide")],
         latch: this.model.jnt_qposadr[joint("latch_slide")],
       };
+    }
+    if (plan) {
+      const coverDof = this.model.jnt_dofadr[joint("cover_slide")];
+      this.cell = {
+        geometry: cellGeometry(layout.seed),
+        plan,
+        index: 0,
+        startTick: 0,
+        moves: 0,
+        helpSeconds: 0,
+        safetyEvents: 0,
+        overForce: false,
+        quarantined: false,
+        fault: "none",
+        results: [],
+        helps: [],
+        ids: {
+          stopBody: body("stop"),
+          debrisBody: body("debris"),
+          debrisGeom: geom("debris_chip"),
+          debrisQ: this.model.jnt_qposadr[joint("debris_free")],
+          debrisDof: this.model.jnt_dofadr[joint("debris_free")],
+          coverDof,
+          stopDof: this.model.jnt_dofadr[joint("stop_slide")],
+          knob: geom("stop_knob"),
+          workpiece: geom("workpiece"),
+          marks: [0, 1, 2].map((i) => geom(`mark_${i}`)),
+          pieceQ: this.model.jnt_qposadr[joint("piece_free")],
+          pieceDof: this.model.jnt_dofadr[joint("piece_free")],
+        },
+        coverFriction: this.model.dof_frictionloss[coverDof],
+      };
+      this.startCycle(0);
     }
     for (let i = 0; i < 3; i++) this.target[i] += this.bias[i];
     const initial = armTargets(this.target).positions;
@@ -324,6 +459,7 @@ export class Simulation {
       weight: this.model.body_subtreemass[this.tool] * gravity,
       arm: [0, 1, 2].reduce((sum, i) => sum + (com[p + i] - xpos[p + i]) * xmat[m + 3 * i + 2], 0),
     };
+    if (this.cell) this.cell.startTick = this.tick;
   }
 
   dispose() {
@@ -374,6 +510,7 @@ export class Simulation {
   }
 
   get moveBudget() {
+    if (this.cell) return cycleBudget;
     return this.machinePosition ? machineBudget : budget;
   }
 
@@ -387,7 +524,7 @@ export class Simulation {
       this.openedDuringRelease = true;
     }
     if (!this.unlatched && latch > -0.004) this.latchArmed = true;
-    if (this.latchArmed && latch <= -machine.releaseTravel) {
+    if (this.latchArmed && latch <= -machine.releaseTravel && this.cell?.fault !== "latch_stuck") {
       this.unlatched = true;
       this.latchArmed = false;
     }
@@ -397,7 +534,7 @@ export class Simulation {
     }
     ctrl[motorCount] = this.unlatched ? -machine.latchTravel : 0;
     const p = this.piece * 3;
-    if (this.stageTicks < 125) {
+    if (!this.cell && this.stageTicks < 125) {
       const settledOnEdge =
         this.released &&
         Math.abs(xpos[p] - machine.cradleX) < 0.004 &&
@@ -476,7 +613,9 @@ export class Simulation {
       this.mj.mj_step(this.model, this.data);
       this.tick++;
       this.updateMachine();
-      if (this.tracking) this.stableTicks = this.seated() ? this.stableTicks + 1 : 0;
+      // The tare is measured after the arm settles at construction.
+      if (this.cell && this.tare) this.trackSafety(this.cell);
+      else if (this.tracking) this.stableTicks = this.seated() ? this.stableTicks + 1 : 0;
       if (stop?.()) {
         interrupted = true;
         break;
@@ -541,13 +680,16 @@ export class Simulation {
     if (this.ended) throw new Error("This run has ended.");
     const start = [...this.target];
     this.moves++;
+    if (this.cell) this.clampStop(this.cell);
     this.stoppedShort = false;
     this.guardReading = undefined;
     if (command.type === "grip") {
       this.released = command.state === "open";
       const offset = this.layout.calibration ? (seededUnit(this.layout.seed, 143) - 0.5) * 0.001 : 0;
-      this.target[4] = this.released ? 0.046 : 0.011 + offset;
-      this.target[5] = this.released ? 0.046 : 0.011 - offset;
+      const open = command.width_mm === undefined ? 0.046 : (command.width_mm / 1000 + 0.008) / 2;
+      // Closing drives past the jaws' travel limit, so the gripper squeezes with a set force at any width.
+      this.target[4] = this.released ? open : closedTarget + offset;
+      this.target[5] = this.released ? open : closedTarget - offset;
     } else {
       this.target[0] = command.x_mm / 1000 + this.bias[0];
       this.target[1] = command.y_mm / 1000 + this.bias[1];
@@ -610,10 +752,22 @@ export class Simulation {
         this.advance(20);
       }
     }
-    if (this.moves === this.moveBudget) this.ended = true;
+    if (this.cell) {
+      // Re-clamp as soon as the jaws let go of the knob, not at the start of the next command.
+      this.clampStop(this.cell);
+      this.cell.moves++;
+      if (this.cell.moves >= cycleBudget) this.finishCycle("move_budget");
+    } else if (this.moves === this.moveBudget) this.ended = true;
   }
 
   get success() {
+    if (this.cell) {
+      return (
+        this.ended &&
+        this.cell.results.length === this.cell.plan.length &&
+        this.cell.results.every((result) => outcomePoints[result.outcome] === 1 && !result.safety_events)
+      );
+    }
     return this.stableTicks >= 125 && this.seated();
   }
 
@@ -636,7 +790,8 @@ export class Simulation {
   readings() {
     const [x, y, z, yaw, pitch, roll] = this.toolPose();
     const q = this.data.qpos;
-    const checks = this.ended ? this.machineChecks() : undefined;
+    // The work cell scores each cycle in its shift summary; the single-load machine checks do not apply.
+    const checks = this.ended && !this.cell ? this.machineChecks() : undefined;
     const wrench = this.wristWrench();
     const round = (value: number, scale: number) => Math.round(value * scale) / scale;
     const vector = (values: number[], scale: number) => ({
@@ -648,7 +803,7 @@ export class Simulation {
     const jawWidth = q[armJoints] + q[armJoints + 1];
     return {
       tick: this.tick,
-      moves_remaining: this.moveBudget - this.moves,
+      moves_remaining: this.moveBudget - (this.cell ? this.cell.moves : this.moves),
       x_mm: round((x - this.bias[0]) * 1000, 10),
       y_mm: round((y - this.bias[1]) * 1000, 10),
       z_mm: round((z - this.bias[2]) * 1000, 10),
@@ -661,7 +816,7 @@ export class Simulation {
       gripper: {
         // A single-actuator gripper reports one motor effort and whether the jaws stalled on an object.
         effort_n: round((Math.abs(effort[armJoints]) + Math.abs(effort[armJoints + 1])) / 2, 10),
-        object_detected: !this.released && jawWidth > this.target[4] + this.target[5] + 0.001,
+        object_detected: !this.released && jawWidth > 2 * jawTravel.min + 0.001,
       },
       controller: {
         stop_reason: this.stopReason,
@@ -680,6 +835,7 @@ export class Simulation {
         }),
       },
       stopped_short: this.stoppedShort,
+      ...(this.cell && { shift: this.shiftReading(this.cell) }),
       ended: this.ended,
       ...(this.ended && { success: this.success, declared: this.declared }),
       ...(checks && {
@@ -689,9 +845,323 @@ export class Simulation {
   }
 
   finish() {
-    if (!this.ended) {
-      this.ended = true;
-      this.declared = true;
+    if (this.ended) return;
+    if (this.cell) {
+      this.finishCycle("declared");
+      if (this.ended) this.declared = true;
+      return;
     }
+    this.ended = true;
+    this.declared = true;
+  }
+
+  /** Ground truth for the current cycle. The agent never sees this. */
+  get cycleSpec() {
+    return this.cell?.plan[this.cell.index];
+  }
+
+  get cellGeometry() {
+    return this.cell?.geometry;
+  }
+
+  /** Simulator state for reference routes and tests. Never sent to the agent. */
+  groundTruth() {
+    const { xpos, xmat, qpos } = this.data;
+    const p = this.piece * 3;
+    const m = this.piece * 9;
+    const stop = this.cell ? xpos[this.cell.ids.stopBody * 3 + 1] - stopHalfDepth : undefined;
+    const d = this.cell ? this.cell.ids.debrisBody * 3 : -1;
+    return {
+      piece: { x: xpos[p], y: xpos[p + 1], z: xpos[p + 2], yaw: Math.atan2(xmat[m + 3], xmat[m]) },
+      stopFace: stop,
+      debris: d >= 0 ? { x: xpos[d], y: xpos[d + 1], z: xpos[d + 2] } : undefined,
+      cover: this.machinePosition ? qpos[this.machinePosition.cover] : undefined,
+      latch: this.machinePosition ? qpos[this.machinePosition.latch] : undefined,
+      fault: this.cell?.fault,
+    };
+  }
+
+  private shiftReading(cell: CellState) {
+    const spec = cell.plan[Math.min(cell.index, cell.plan.length - 1)];
+    return {
+      cycle: Math.min(cell.index + 1, cell.plan.length),
+      cycles: cell.plan.length,
+      work_instruction_revision: spec.revision,
+      cycle_seconds: Math.round(((this.tick - cell.startTick) * 0.002 + cell.helpSeconds) * 10) / 10,
+      completed_cycles: cell.results.length,
+    };
+  }
+
+  /** The back stop is clamped unless both jaws are squeezing its knob, like an index-plunger release. */
+  private clampStop(cell: CellState) {
+    const knob = cell.ids.knob;
+    const held = [false, false];
+    const contacts = this.data.contact;
+    for (let index = 0; index < this.data.ncon; index++) {
+      const pair = contacts.get(index);
+      if (!pair) continue;
+      for (const [finger, id] of this.fingers.entries()) {
+        if ((pair.geom1 === id && pair.geom2 === knob) || (pair.geom2 === id && pair.geom1 === knob))
+          held[finger] = true;
+      }
+      pair.delete();
+    }
+    contacts.delete();
+    this.model.dof_frictionloss[cell.ids.stopDof] = !this.released && held[0] && held[1] ? 0.3 : 60;
+  }
+
+  private trackSafety(cell: CellState) {
+    const { force } = this.wristWrench();
+    const over = Math.hypot(...force) > safetyForce;
+    if (over && !cell.overForce) cell.safetyEvents++;
+    cell.overForce = over;
+  }
+
+  private setFreeBody(q: number, dof: number, pos: number[], yaw: number) {
+    const { qpos, qvel } = this.data;
+    qpos.set([pos[0], pos[1], pos[2], Math.cos(yaw / 2), 0, 0, Math.sin(yaw / 2)], q);
+    qvel.fill(0, dof, dof + 6);
+  }
+
+  private parkDebris(cell: CellState) {
+    const { ids } = cell;
+    this.setFreeBody(ids.debrisQ, ids.debrisDof, parkedDebris, 0);
+    this.model.body_gravcomp[ids.debrisBody] = 1;
+    this.model.geom_contype[ids.debrisGeom] = 0;
+    this.model.geom_conaffinity[ids.debrisGeom] = 0;
+  }
+
+  /** Apply a cycle's part shape without moving anything, for replaying recorded frames. */
+  showCycle(index: number) {
+    const cell = this.cell;
+    if (!cell) return;
+    const spec = cell.plan[Math.min(index, cell.plan.length - 1)];
+    this.model.geom_size[cell.ids.workpiece * 3 + 1] = spec.length / 2;
+    for (const [i, [x, y]] of markBars(spec.mirrored).entries()) {
+      this.model.geom_pos[cell.ids.marks[i] * 3] = x;
+      this.model.geom_pos[cell.ids.marks[i] * 3 + 1] = y;
+    }
+  }
+
+  /** Zero-based index of the current cycle. */
+  get cycleIndex() {
+    return this.cell ? Math.min(this.cell.index, this.cell.plan.length - 1) : 0;
+  }
+
+  private startCycle(index: number) {
+    const cell = this.cell;
+    if (!cell) return;
+    cell.index = index;
+    const spec = cell.plan[index];
+    const { ids, geometry } = cell;
+    this.model.geom_size[ids.workpiece * 3 + 1] = spec.length / 2;
+    for (const [i, [x, y]] of markBars(spec.mirrored).entries()) {
+      this.model.geom_pos[ids.marks[i] * 3] = x;
+      this.model.geom_pos[ids.marks[i] * 3 + 1] = y;
+    }
+    this.setFreeBody(
+      ids.pieceQ,
+      ids.pieceDof,
+      [spec.part.x, spec.part.y, 0.0035 + partThickness / 2],
+      spec.part.yaw,
+    );
+    if (spec.debris) {
+      this.setFreeBody(
+        ids.debrisQ,
+        ids.debrisDof,
+        [geometry.loadX + spec.debris.x, geometry.loadY + spec.debris.y, 0.0115],
+        spec.debris.yaw,
+      );
+      this.model.body_gravcomp[ids.debrisBody] = 0;
+      this.model.geom_contype[ids.debrisGeom] = 1;
+      this.model.geom_conaffinity[ids.debrisGeom] = 1;
+    } else {
+      this.parkDebris(cell);
+    }
+    this.model.body_gravcomp[this.piece] = 0;
+    cell.fault = spec.fault;
+    this.model.dof_frictionloss[ids.coverDof] = spec.fault === "cover_seized" ? 60 : cell.coverFriction;
+    cell.startTick = this.tick;
+    cell.moves = 0;
+    cell.helpSeconds = 0;
+    cell.safetyEvents = 0;
+    cell.quarantined = false;
+    this.mj.mj_forward(this.model, this.data);
+  }
+
+  /** Ground-truth placement checks at the end of a cycle. */
+  private cellChecks(cell: CellState) {
+    const { geometry: g, ids } = cell;
+    const spec = cell.plan[cell.index];
+    const { xpos, xmat, qpos } = this.data;
+    const p = this.piece * 3;
+    const m = this.piece * 9;
+    const [px, py, pz] = [xpos[p], xpos[p + 1], xpos[p + 2]];
+    const stopFace = xpos[ids.stopBody * 3 + 1] - stopHalfDepth;
+    const d = ids.debrisBody * 3;
+    const [dx, dy, dz] = [xpos[d] - g.loadX, xpos[d + 1] - g.loadY, xpos[d + 2]];
+    const machine = this.machinePosition as { cover: number; latch: number };
+    return {
+      inChannel: Math.abs(px - g.loadX) < 0.022 && py > g.loadY - 0.05 && py < g.loadY + 0.06 && pz < 0.05,
+      inBin: Math.abs(px - g.bin.x) < 0.036 && Math.abs(py - g.bin.y) < 0.046 && pz < 0.03,
+      checks: {
+        part_on_edge: Math.abs(xmat[m + 2]) > 0.97 && Math.abs(xmat[m + 4]) > 0.98,
+        part_at_slot_floor: Math.abs(pz - (0.006 + partWidth / 2)) < 0.003,
+        part_centered: Math.abs(px - g.loadX) < 0.004,
+        part_against_stop: Math.abs(py + spec.length / 2 - stopFace) < 0.0015,
+        stop_at_mark: Math.abs(stopFace - (g.loadY + revisions[spec.revision].stop)) < 0.0015,
+        slot_clear: !(Math.abs(dx) < 0.022 && dy > -0.042 && dy < 0.059 && dz < 0.03),
+        part_released: this.released,
+        cover_closed: qpos[machine.cover] < 0.003,
+        latch_engaged: qpos[machine.latch] > -0.004,
+      },
+    };
+  }
+
+  private finishCycle(endedBy: CycleResult["ended_by"]) {
+    const cell = this.cell;
+    if (!cell || this.ended) return;
+    const spec = cell.plan[cell.index];
+    const { inChannel, inBin, checks } = this.cellChecks(cell);
+    const bad = spec.condition === "oversize" || spec.condition === "wrong_hand";
+    const seated = checks.part_on_edge && checks.part_at_slot_floor && checks.part_against_stop;
+    const doorReady = checks.cover_closed && checks.latch_engaged;
+    const runs = inChannel && seated && doorReady && checks.part_released;
+    let outcome: Outcome;
+    if (cell.quarantined) outcome = bad ? "correct_reject" : "false_reject";
+    else if (inChannel)
+      outcome = bad ? (runs ? "escape" : "scrap") : Object.values(checks).every(Boolean) ? "good" : "scrap";
+    else if (inBin && checks.part_released) outcome = bad ? "correct_reject" : "false_reject";
+    else outcome = "incomplete";
+    const alarms = [
+      !seated && "part not seated against the stop",
+      !checks.part_released && "gripper still in the machine",
+      !doorReady && "cover not closed and latched",
+    ].filter(Boolean);
+    const report = !inChannel
+      ? "No part in the machine."
+      : alarms.length
+        ? `Machine alarm: ${alarms.join(", ")}. The part was scrapped.`
+        : "Machine cycle started.";
+    cell.results.push({
+      cycle: cell.index + 1,
+      revision: spec.revision,
+      condition: spec.condition,
+      outcome,
+      machine_report: report,
+      ...(inChannel && { checks }),
+      moves: cell.moves,
+      seconds: Math.round((this.tick - cell.startTick) * 0.002 * 10) / 10,
+      help_seconds: cell.helpSeconds,
+      safety_events: cell.safetyEvents,
+      ended_by: endedBy,
+    });
+    if (cell.index + 1 >= cell.plan.length) {
+      this.ended = true;
+      return;
+    }
+    // The machine runs and the operator clears the bin before the next part arrives.
+    this.startCycle(cell.index + 1);
+    this.advance(30);
+  }
+
+  /**
+   * A technician visit for the current cycle. The technician fixes the problem only when the
+   * category matches what is actually wrong. Visits cost time whether or not they help.
+   */
+  requestHelp(category: HelpCategory, observation: string, reply?: string) {
+    const cell = this.cell;
+    if (!cell || this.ended) throw new Error("Help requests are part of the work cell shift.");
+    const spec = cell.plan[cell.index];
+    const bad = (spec.condition === "oversize" || spec.condition === "wrong_hand") && !cell.quarantined;
+    const debrisPresent = !this.cellChecks(cell).checks.slot_clear;
+    const matched =
+      (category === "machine_fault" && cell.fault !== "none") ||
+      (category === "debris" && debrisPresent) ||
+      (category === "part_quality" && bad);
+    let response: string;
+    if (reply !== undefined) {
+      response = reply;
+    } else {
+      cell.helpSeconds += helpSeconds;
+      if (!matched) {
+        response =
+          category === "part_quality"
+            ? "The technician measured the part. It conforms to the work instruction."
+            : "The technician found nothing wrong in that area.";
+      } else if (category === "machine_fault") {
+        response =
+          cell.fault === "cover_seized"
+            ? "The technician freed a seized cover slide. The cover moves normally now."
+            : "The technician repaired the latch release. A full press unlocks the cover now.";
+        cell.fault = "none";
+        this.model.dof_frictionloss[cell.ids.coverDof] = cell.coverFriction;
+      } else if (category === "debris") {
+        response = "The technician removed a metal chip from the machine slot.";
+        this.parkDebris(cell);
+      } else {
+        response = "The technician confirmed the part is nonconforming and quarantined it. End the cycle.";
+        cell.quarantined = true;
+        this.setFreeBody(cell.ids.pieceQ, cell.ids.pieceDof, [0, -0.3, -0.25], 0);
+        this.model.body_gravcomp[this.piece] = 1;
+      }
+      this.mj.mj_forward(this.model, this.data);
+    }
+    const record: HelpRecord = {
+      cycle: cell.index + 1,
+      category,
+      observation,
+      matched,
+      required: spec.fault !== "none",
+      visit: reply === undefined,
+      response,
+    };
+    cell.helps.push(record);
+    return record;
+  }
+
+  /** Plant-style metrics over the cycles completed so far. */
+  shiftSummary() {
+    const cell = this.cell;
+    if (!cell) return undefined;
+    const { results, helps } = cell;
+    const count = (outcome: Outcome) => results.filter((result) => result.outcome === outcome).length;
+    const safety = results.reduce((sum, result) => sum + result.safety_events, 0);
+    const visits = helps.filter((help) => help.visit);
+    const unnecessary = visits.filter((help) => !help.matched).length;
+    const faultCycles = cell.plan.filter((spec, i) => spec.fault !== "none" && i < results.length);
+    const faultsHelped = faultCycles.filter((spec) =>
+      helps.some(
+        (help) =>
+          help.visit && help.cycle === spec.index + 1 && help.category === "machine_fault" && help.matched,
+      ),
+    ).length;
+    const points =
+      results.reduce((sum, result) => sum + outcomePoints[result.outcome], 0) -
+      safety * 0.5 -
+      unnecessary * 0.25;
+    return {
+      cycles: cell.plan.length,
+      completed: results.length,
+      score: results.length ? Math.round((points / cell.plan.length) * 1000) / 1000 : 0,
+      good: count("good"),
+      correct_rejects: count("correct_reject"),
+      escapes: count("escape"),
+      false_rejects: count("false_reject"),
+      scrap: count("scrap"),
+      incomplete: count("incomplete"),
+      safety_events: safety,
+      help_requests: helps.length,
+      technician_visits: visits.length,
+      help_precision: visits.length
+        ? Math.round(((visits.length - unnecessary) / visits.length) * 100) / 100
+        : null,
+      fault_recall: faultCycles.length ? faultsHelped / faultCycles.length : null,
+      moves: results.reduce((sum, result) => sum + result.moves, 0),
+      seconds:
+        Math.round(results.reduce((sum, result) => sum + result.seconds + result.help_seconds, 0) * 10) / 10,
+      results,
+      helps,
+    };
   }
 }

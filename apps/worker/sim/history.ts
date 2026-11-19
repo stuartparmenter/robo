@@ -4,6 +4,8 @@ import type { FieldPose } from "./view";
 
 export type Frame = {
   label: string;
+  /** Zero-based work cell cycle the frame belongs to. */
+  cycle?: number;
   readings: ReturnType<Simulation["readings"]>;
   poses: { qpos: number[]; mocap_pos: number[]; mocap_quat: number[] };
   images: Record<Exclude<Camera, "inspection">, string> & { inspection?: string };
@@ -24,6 +26,8 @@ export type RunSummary = {
   budget: number;
   thumbnail: string;
   result: "passed" | "failed" | "unfinished";
+  /** Work cell shift metrics, saved so replays can show them. */
+  shift?: ReturnType<Simulation["shiftSummary"]>;
 };
 
 export type RunFrame = {
@@ -33,7 +37,16 @@ export type RunFrame = {
   perspective: FieldPose;
   motion?: FieldPose[];
 };
-type RunTrace = { runId: string; calls: RecordedCall[]; omittedCalls: number };
+export type RoutineRecord = {
+  code: string;
+  cycles: number;
+  status: string;
+  message?: string;
+  log: string[];
+  cyclesDone?: number;
+  reports?: unknown[];
+};
+type RunTrace = { runId: string; calls: RecordedCall[]; omittedCalls: number; routines?: RoutineRecord[] };
 
 let database: Promise<IDBDatabase> | undefined;
 

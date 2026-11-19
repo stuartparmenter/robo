@@ -65,10 +65,46 @@ export function serveMcp(
     server.registerTool(
       "finish",
       {
-        description: "Declare the attempt complete. The simulator scores the result.",
+        description:
+          "Declare the attempt complete. The simulator scores the result. In a work cell shift this ends the current cycle and starts the next.",
         inputSchema: toolInputs.finish.extend(game),
       },
       ({ game_id, ...args }) => call(game_id, { tool: "finish", ...args }),
+    );
+    server.registerTool(
+      "get_work_instruction",
+      {
+        description: "Work cell shift: the current work instruction text and its part drawing.",
+        inputSchema: toolInputs.get_work_instruction.extend(game),
+      },
+      ({ game_id }) => call(game_id, { tool: "get_work_instruction" }),
+    );
+    server.registerTool(
+      "request_help",
+      {
+        description:
+          "Work cell shift: call a technician for the current cycle. Each visit costs 90 seconds of shift time. The technician fixes the problem only if your category matches what is wrong.",
+        inputSchema: toolInputs.request_help.extend(game),
+      },
+      ({ game_id, ...args }) => call(game_id, { tool: "request_help", ...args }),
+    );
+    server.registerTool(
+      "run_routine",
+      {
+        description:
+          "Work cell shift: start a routine you wrote that runs whole cycles without you. It starts at the beginning of a cycle and returns immediately; poll routine_status.",
+        inputSchema: toolInputs.run_routine.extend(game),
+      },
+      ({ game_id, ...args }) => call(game_id, { tool: "run_routine", ...args }),
+    );
+    server.registerTool(
+      "routine_status",
+      {
+        description:
+          "Work cell shift: wait for the running routine to change state, answer its question, or stop it.",
+        inputSchema: toolInputs.routine_status.extend(game),
+      },
+      ({ game_id, ...args }) => call(game_id, { tool: "routine_status", ...args }),
     );
     return server;
   });

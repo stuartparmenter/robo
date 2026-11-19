@@ -23,11 +23,13 @@
       <dialog id="setup" aria-labelledby="setup-title">
         <div class="setup-heading"><h2 id="setup-title">New run</h2><button id="cancel-setup" type="button">Cancel</button></div>
         <form id="layout">
-          <label>Puzzle <select id="task"><option value="peg">Peg insertion</option><option value="block">Block transfer</option><option value="keyed">Keyed socket</option><option value="machine">Machine loading</option></select></label>
+          <label>Puzzle <select id="task"><option value="peg">Peg insertion</option><option value="block">Block transfer</option><option value="keyed">Keyed socket</option><option value="machine">Machine loading</option><option value="cell">Work cell shift</option></select></label>
           <label>Seed <input id="seed" type="number" min="1" max="999999" value="1" required></label>
           <label><span id="angle-label">Fixture angle</span> <input id="angle" type="number" min="-180" max="180" value="26" required></label>
           <label>Agent images <select id="cadence"><option value="1">Every move</option><option value="3">Every 3 moves</option></select></label>
-          <label class="toggle"><input type="checkbox" id="shift"> Shift after pickup</label>
+          <label id="cycles-field" hidden>Cycles <input id="cycles" type="number" min="4" max="12" value="8" required></label>
+          <label class="toggle" id="shift-field"><input type="checkbox" id="shift"> Shift after pickup</label>
+          <label class="toggle" id="attended-field" hidden><input type="checkbox" id="attended"> A person answers help requests</label>
           <label class="toggle"><input type="checkbox" id="calibration"> Calibration error</label>
           <button class="primary" type="submit">Start run</button>
         </form>
@@ -76,9 +78,26 @@
               <button type="button" id="connect" hidden>Retry connection</button>
               <p class="hint" id="connection" role="status"></p>
             </section>
+            <section id="help-panel" hidden aria-live="polite">
+              <h2>Help requested</h2>
+              <p id="help-request"></p>
+              <label>Reply <textarea id="help-reply" rows="2" placeholder="Optional message to the agent"></textarea></label>
+              <div class="actions">
+                <button type="button" class="primary" id="help-dispatch">Send technician</button>
+                <button type="button" id="help-send">Send reply</button>
+                <button type="button" id="help-decline">Decline</button>
+              </div>
+            </section>
+            <section id="shift-panel" hidden>
+              <h2>Shift</h2>
+              <p class="hint" id="shift-summary"></p>
+              <div class="table-wrap"><table id="shift-table"><thead><tr><th>#</th><th>Rev</th><th>Condition</th><th>Outcome</th><th>Moves</th><th>Time</th></tr></thead><tbody></tbody></table></div>
+              <details id="routine-panel" hidden><summary>Routine · <span id="routine-status">idle</span></summary><pre id="routine-log"></pre><pre id="routine-code"></pre></details>
+            </section>
             <section>
               <h2>Objective</h2>
               <p class="hint" id="goal"></p>
+              <img id="work-instruction-image" width="760" height="520" alt="Work instruction drawing for the current revision" hidden>
               <button type="button" id="share">Copy layout link</button>
               <a class="button-link" id="repeat-run" href="/" hidden>Run this layout again</a>
             </section>

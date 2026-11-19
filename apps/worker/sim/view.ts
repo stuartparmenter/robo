@@ -13,8 +13,8 @@ export const overheadHalfExtent = { x: 0.304, y: 0.208 };
 const overheadPxPerMm = width / (overheadHalfExtent.x * 2000);
 
 type Vec3 = [number, number, number];
-function orthographic(halfX: number, halfY: number, position: Vec3, up: Vec3, target: Vec3) {
-  const camera = new THREE.OrthographicCamera(-halfX, halfX, halfY, -halfY, 0.01, 4);
+function orthographic(halfX: number, halfY: number, position: Vec3, up: Vec3, target: Vec3, near = 0.01) {
+  const camera = new THREE.OrthographicCamera(-halfX, halfX, halfY, -halfY, near, 4);
   camera.position.set(...position);
   camera.up.set(...up);
   camera.lookAt(...target);
@@ -45,26 +45,12 @@ function geometry(type: number, a: number, b: number, c: number) {
 export class FieldView {
   private readonly scene = new THREE.Scene();
   private readonly renderer = new THREE.WebGLRenderer({ antialias: true });
-  private readonly cameras: Record<Camera, THREE.OrthographicCamera> = {
-    overhead: orthographic(overheadHalfExtent.x, overheadHalfExtent.y, [0, 0, 0.8], [0, 1, 0], [0, 0, 0]),
-    side: orthographic(
-      overheadHalfExtent.x,
-      overheadHalfExtent.y,
-      [0, -0.65, 0.23],
-      [0, 0, 1],
-      [0, 0, 0.105],
-    ),
-    inspection: orthographic(
-      0.076,
-      0.052,
-      [machine.loadX, -0.62, 0.095],
-      [0, 0, 1],
-      [machine.loadX, machine.loadY, 0.039],
-    ),
-  };
+  private readonly cameras: Record<Camera, THREE.OrthographicCamera>;
   private readonly rotation = new THREE.Matrix4();
   private readonly rotation3 = new THREE.Matrix3();
   private readonly meshes: THREE.Mesh[] = [];
+  /** Geom sizes the meshes were built with, so per-cycle part changes can be redrawn. */
+  private sizes: Float64Array = new Float64Array();
   private readonly output = document.createElement("canvas");
   private readonly pen: CanvasRenderingContext2D;
   private readonly thumbnailCanvas = document.createElement("canvas");
@@ -78,6 +64,26 @@ export class FieldView {
   private previewPose?: FieldPose;
 
   constructor(sim: Simulation, preview: HTMLCanvasElement) {
+    const slot = sim.cellGeometry ?? machine;
+    this.cameras = {
+      overhead: orthographic(overheadHalfExtent.x, overheadHalfExtent.y, [0, 0, 0.8], [0, 1, 0], [0, 0, 0]),
+      side: orthographic(
+        overheadHalfExtent.x,
+        overheadHalfExtent.y,
+        [0, -0.65, 0.23],
+        [0, 0, 1],
+        [0, 0, 0.105],
+      ),
+      inspection: orthographic(
+        0.076,
+        0.052,
+        [slot.loadX, -0.62, 0.095],
+        [0, 0, 1],
+        [slot.loadX, slot.loadY, 0.039],
+        // In the work cell, clip the front-row stations between the camera and the machine.
+        sim.cellGeometry ? 0.62 + slot.loadY - 0.075 : 0.01,
+      ),
+    };
     const previewPen = preview.getContext("2d");
     if (!previewPen) throw new Error("Canvas 2D is unavailable.");
     this.previewPen = previewPen;
@@ -127,6 +133,7 @@ export class FieldView {
       this.scene.add(mesh);
     }
 
+    this.sizes = Float64Array.from(sim.model.geom_size);
     const vertices: number[] = [];
     for (let index = -5; index <= 5; index++) {
       const x = index * 0.05;
@@ -144,6 +151,19 @@ export class FieldView {
         new THREE.LineBasicMaterial({ color: 0x91a7aa, transparent: true, opacity: 0.3 }),
       ),
     );
+  }
+
+  /** Rebuild meshes whose geom size changed, such as the part between work cell cycles. */
+  refreshShapes(sim: Simulation) {
+    const { geom_size: size, geom_type: type } = sim.model;
+    for (const [i, mesh] of this.meshes.entries()) {
+      const [a, b, c] = size.subarray(3 * i, 3 * i + 3);
+      if (a === this.sizes[3 * i] && b === this.sizes[3 * i + 1] && c === this.sizes[3 * i + 2]) continue;
+      mesh.geometry.dispose();
+      mesh.geometry = geometry(type[i], a, b, c);
+    }
+    this.sizes = Float64Array.from(size);
+    this.posedTick = -1;
   }
 
   private applyPose({ pos, mat }: FieldPose) {
