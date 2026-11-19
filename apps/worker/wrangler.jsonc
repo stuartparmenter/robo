@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "robo-playground",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-17",
+  // MCP bearer tokens are part of the request path.
+  "observability": { "enabled": false },
+  "build": { "command": "bun run build", "watch_dir": ["src", "public", "sim", "../../tooling"] },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*"]
+  },
+  "durable_objects": { "bindings": [{ "name": "RUNS", "class_name": "RunRelay" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RunRelay"] }],
+  "ratelimits": [
+    { "name": "CREATE_LIMITER", "namespace_id": "2101", "simple": { "limit": 10, "period": 60 } }
+  ]
+}

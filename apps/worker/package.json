@@ -1,0 +1,21 @@
+{
+  "name": "@robo/worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run ../../tooling/build.ts",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "wrangler types && tsc && tsc -p sim/tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "@mujoco/mujoco": "4.0.1",
+    "three": "0.183.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/three": "0.183.1",
+    "wrangler": "4.164.0"
+  }
+}

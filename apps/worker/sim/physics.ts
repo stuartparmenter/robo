@@ -1,0 +1,758 @@
+import loadMuJoCo, { type MainModule } from "@mujoco/mujoco";
+import { budget, type Command, type Guard, machineBudget } from "../src/protocol";
+import { machine, machineFixture } from "./machine";
+
+export type Layout = {
+  task: "peg" | "block" | "keyed" | "machine";
+  seed: number;
+  angle: number;
+  shift: boolean;
+  cadence: 1 | 3;
+  calibration?: boolean;
+};
+
+export const defaultLayout: Layout = { task: "peg", seed: 1, angle: 26, shift: false, cadence: 1 };
+
+const radians = Math.PI / 180;
+const gravity = 9.81;
+const box = (name: string, size: string, pos: string, rgba: string, props = "") =>
+  `<geom name="${name}" type="box" size="${size}" pos="${pos}" rgba="${rgba}" ${props}/>`;
+
+const baseY = 0.26;
+const shoulderZ = 0.19;
+const upper = 0.31;
+const forearm = 0.28;
+const toolOffset = 0.065;
+const armJoints = 6;
+const gripperJoints = 2;
+/** Actuated joints come first in qpos, qvel and ctrl; the piece's free joint follows. */
+const motorCount = armJoints + gripperJoints;
+/** Each ramped move or settle advances this many steps after the final target. */
+const settleSteps = 220;
+/** Guarded moves drive in 0.02 s increments and are capped at this much travel time. */
+export const guardSeconds = 4;
+
+const jointLimits = [
+  { name: "base_yaw", min: -180, max: 10 },
+  { name: "shoulder_pitch", min: -170, max: 100 },
+  { name: "elbow_pitch", min: -2, max: 180 },
+  { name: "wrist_pitch", min: -360, max: 360, wraps: true },
+  { name: "wrist_roll", min: -100, max: 100 },
+  { name: "tool_yaw", min: -360, max: 360, wraps: true },
+] as const;
+type StopReason =
+  | "idle"
+  | "target_reached"
+  | "force_limit"
+  | "joint_limit"
+  | "unreachable"
+  | "blocked_by_contact"
+  | "position_error"
+  | "time_limit"
+  | "grip_complete";
+
+function armJoint(index: number, axis: string, damping: string) {
+  const { name, min, max } = jointLimits[index];
+  return `<joint name="${name}" axis="${axis}" damping="${damping}" range="${min} ${max}"/>`;
+}
+
+function seededUnit(seed: number, salt: number) {
+  const value = Math.imul(seed ^ salt, 0x45d9f3b);
+  return ((value ^ (value >>> 16)) >>> 0) / 2 ** 32;
+}
+
+function positionBias(layout: Layout) {
+  return [71, 83, 97].map((salt, index) =>
+    layout.calibration ? (seededUnit(layout.seed, salt) - 0.5) * (index === 2 ? 0.0016 : 0.004) : 0,
+  );
+}
+
+function rotation(yaw: number, pitch: number, roll: number) {
+  const [cy, sy] = [Math.cos(yaw), Math.sin(yaw)];
+  const [cp, sp] = [Math.cos(pitch), Math.sin(pitch)];
+  const [cr, sr] = [Math.cos(roll), Math.sin(roll)];
+  // World yaw, followed by local pitch and roll (ZYX).
+  return [
+    cy * cp,
+    cy * sp * sr - sy * cr,
+    cy * sp * cr + sy * sr,
+    sy * cp,
+    sy * sp * sr + cy * cr,
+    sy * sp * cr - cy * sr,
+    -sp,
+    cp * sr,
+    cp * cr,
+  ];
+}
+
+function armTargets([x, y, z, yaw, left, right, pitch, roll]: number[], previous?: Float64Array) {
+  const m = rotation(yaw, pitch, roll);
+  const centerX = x + m[2] * toolOffset;
+  const centerY = y + m[5] * toolOffset - baseY;
+  const drop = shoulderZ - z - m[8] * toolOffset;
+  const radius = Math.hypot(centerX, centerY);
+  const base = Math.atan2(centerY, centerX);
+  const cosine = (radius ** 2 + drop ** 2 - upper ** 2 - forearm ** 2) / (2 * upper * forearm);
+  const elbow = Math.acos(Math.max(-1, Math.min(1, cosine)));
+  const shoulder =
+    Math.atan2(drop, radius) - Math.atan2(forearm * Math.sin(elbow), upper + forearm * Math.cos(elbow));
+
+  // Remove the base rotation, then decompose the wrist as YXZ.
+  const [c, s] = [Math.cos(base), Math.sin(base)];
+  const side = -s * m[2] + c * m[5];
+  const wristPitch = Math.atan2(c * m[2] + s * m[5], m[8]) - shoulder - elbow;
+  const wristRoll = Math.asin(Math.max(-1, Math.min(1, -side)));
+  const toolYaw = Math.atan2(-s * m[0] + c * m[3], -s * m[1] + c * m[4]);
+  const result = [base, shoulder, elbow, wristPitch, wristRoll, toolYaw, left, right];
+  let limited = false;
+  for (const [index, joint] of jointLimits.entries()) {
+    const wraps = "wraps" in joint;
+    if (wraps && previous) result[index] = previous[index] + angleDelta(result[index], previous[index]);
+    const lo = joint.min * radians;
+    const hi = joint.max * radians;
+    if (wraps && result[index] < lo && result[index] + 2 * Math.PI <= hi) result[index] += 2 * Math.PI;
+    if (wraps && result[index] > hi && result[index] - 2 * Math.PI >= lo) result[index] -= 2 * Math.PI;
+    const bounded = Math.max(lo, Math.min(hi, result[index]));
+    limited ||= bounded !== result[index];
+    result[index] = bounded;
+  }
+  return { positions: result, limited, unreachable: Math.abs(cosine) > 1 };
+}
+
+function angleDelta(target: number, current: number) {
+  const delta = target - current;
+  return Math.atan2(Math.sin(delta), Math.cos(delta));
+}
+
+export function layoutGeometry(layout: Layout) {
+  const random = (salt: number) => seededUnit(layout.seed, salt);
+  const graspYawError = layout.calibration ? (random(131) - 0.5) * 5 : 0;
+  // Machine loading uses the angle setting to rotate the part instead of the fixture.
+  const partRotation = layout.task === "machine" ? layout.angle - 26 : 0;
+  return {
+    x: -0.131 + random(17) * 0.024,
+    y: -0.055 + random(37) * 0.04,
+    yaw: Math.round((random(49) - 0.5) * 42) + graspYawError + partRotation,
+    socketX: 0.118,
+    socketY: 0.041,
+  };
+}
+
+function scene(layout: Layout) {
+  const { x, y, yaw, socketX, socketY } = layoutGeometry(layout);
+  const loading = layout.task === "machine";
+  const peg = layout.task === "peg" || layout.task === "keyed";
+  const linkCollision = loading ? 'contype="2" conaffinity="4"' : 'contype="0" conaffinity="0"';
+  const keyed = layout.task === "keyed";
+  const walls = [
+    box("wall_left", ".008 .030 .014", "-.028 0 .018", ".26 .68 .68 .73"),
+    ...(keyed
+      ? [
+          box("notch_right_lower", ".008 .016 .014", ".028 -.014 .018", ".26 .68 .68 .73"),
+          box("notch_right_upper", ".008 .009 .014", ".028 .021 .018", ".26 .68 .68 .73"),
+          box("notch_stop", ".004 .005 .014", ".032 .007 .018", ".46 .81 .68 .9"),
+        ]
+      : [box("wall_right", ".008 .030 .014", ".028 0 .018", ".26 .68 .68 .73")]),
+    box("wall_back", ".020 .008 .014", "0 .022 .018", ".26 .68 .68 .73"),
+    box("wall_front", ".020 .008 .014", "0 -.022 .018", ".26 .68 .68 .52"),
+  ];
+  return `<mujoco model="Robo">
+    <compiler angle="degree" autolimits="true"/>
+    <option gravity="0 0 -${gravity}" timestep=".002" integrator="implicitfast" cone="elliptic" iterations="45"/>
+    <default>
+      <geom friction="1.2 .01 .001" solref=".006 1" solimp=".95 .99 .001" condim="4"/>
+      <joint damping="4" armature=".01"/>
+    </default>
+    <worldbody>
+      ${box("table", ".26 .20 .008", "0 0 -.008", ".11 .16 .21 1", loading ? 'contype="5"' : "")}
+      ${box("mounting_plate", ".075 .075 .008", "0 .24 -.006", ".17 .23 .29 1", 'group="1" contype="0" conaffinity="0"')}
+      <geom name="arm_mount" type="cylinder" pos="0 ${baseY} .022" size=".058 .030" rgba=".22 .30 .36 1" group="1" contype="0" conaffinity="0"/>
+      <geom name="pedestal" type="cylinder" pos="0 ${baseY} .105" size=".037 .075" rgba=".33 .40 .45 1" group="1" contype="0" conaffinity="0"/>
+      <body name="base" gravcomp="1" pos="0 ${baseY} ${shoulderZ}">
+        ${armJoint(0, "0 0 1", ".8")}
+        <geom type="cylinder" size=".048 .022" rgba=".25 .32 .38 1" group="1" mass=".24" ${linkCollision}/>
+        <body name="upper_arm" gravcomp="1">
+          ${armJoint(1, "0 1 0", ".9")}
+          <geom type="sphere" size=".042" rgba=".30 .37 .42 1" group="1" mass=".14" ${linkCollision}/>
+          <geom type="capsule" fromto=".032 0 0 ${upper - 0.029} 0 0" size=".030" rgba=".93 .58 .20 1" group="1" mass=".45" ${linkCollision}/>
+          <body name="forearm" pos="${upper} 0 0" gravcomp="1">
+            ${armJoint(2, "0 1 0", ".6")}
+            <geom type="sphere" size=".039" rgba=".27 .34 .40 1" group="1" mass=".13" ${linkCollision}/>
+            <geom type="capsule" fromto=".027 0 0 ${forearm - 0.024} 0 0" size=".023" rgba=".93 .58 .20 1" group="1" mass=".26" ${linkCollision}/>
+            <body name="wrist_pitch" pos="${forearm} 0 0" gravcomp="1">
+              ${armJoint(3, "0 1 0", ".24")}
+              <geom type="sphere" size=".028" rgba=".33 .40 .45 1" group="1" mass=".06" ${linkCollision}/>
+              <body name="wrist_roll" gravcomp="1">
+                ${armJoint(4, "1 0 0", ".24")}
+                <geom type="cylinder" pos="0 0 -.025" size=".022 .019" rgba=".42 .51 .57 1" group="1" mass=".07" ${linkCollision}/>
+                <body name="tool" gravcomp="1" pos="0 0 ${-toolOffset}">
+                  <site name="wrist_sensor" size=".001"/>
+                  ${armJoint(5, "0 0 1", ".18")}
+                  ${box("wrist", ".046 .015 .008", "0 0 .027", ".70 .79 .86 1", 'mass=".10"')}
+                  <body name="left" gravcomp="1">
+                    <joint name="left_jaw" type="slide" axis="-1 0 0" range=".010 .047"/>
+                    ${box("left_finger", ".004 .012 .016", "0 0 .007", ".58 .77 .89 1", 'mass=".025" friction="2 .02 .002"')}
+                  </body>
+                  <body name="right" gravcomp="1">
+                    <joint name="right_jaw" type="slide" axis="1 0 0" range=".010 .047"/>
+                    ${box("right_finger", ".004 .012 .016", "0 0 .007", ".58 .77 .89 1", 'mass=".025" friction="2 .02 .002"')}
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="piece" pos="${x} ${y} ${loading ? 0.011 : 0.001}" euler="0 0 ${yaw}">
+        <freejoint name="piece_free"/>
+        ${peg ? box("shaft", ".018 .012 .020", "0 0 .020", ".97 .62 .23 1", 'mass=".020"') : ""}
+        ${peg ? box("band", ".0182 .0122 .003", "0 0 .026", ".99 .88 .57 1", 'mass=".0001" contype="0" conaffinity="0"') : ""}
+        ${keyed ? box("key", ".004 .0035 .016", ".0215 .007 .019", ".97 .8 .34 1", 'mass=".003"') : ""}
+        ${keyed ? box("key_mark", ".006 .004 .0006", ".014 .012 .0584", ".27 .16 .10 1", 'mass=".0001" contype="0" conaffinity="0"') : ""}
+        ${
+          loading
+            ? box("workpiece", ".016 .034 .009", "0 0 0", ".98 .49 .21 1", 'mass=".03"')
+            : box("shoulder", ".023 .017 .009", peg ? "0 0 .049" : "0 0 .010", ".98 .49 .21 1", 'mass=".025"')
+        }
+      </body>
+      ${
+        loading
+          ? machineFixture(layout.seed)
+          : `
+      <body name="fixture_anchor" mocap="true" pos="${socketX} ${socketY} 0" euler="0 0 ${layout.angle}">
+        ${keyed ? box("slide_track", ".045 .058 .001", "0 0 .001", ".24 .31 .35 1", 'contype="0" conaffinity="0"') : ""}
+        <body name="fixture" gravcomp="1">
+          ${keyed ? '<joint name="socket_slide" type="slide" axis="0 1 0" range="-.023 .023" damping="1.6" stiffness="11" frictionloss=".55" armature=".016"/>' : ""}
+          ${box("pad", ".042 .038 .002", "0 0 .002", ".25 .63 .53 1", keyed ? 'mass=".12"' : "")}
+          ${peg ? walls.join("") : ""}
+        </body>
+      </body>
+      `
+      }
+    </worldbody>
+    <contact>
+      <exclude body1="tool" body2="left"/>
+      <exclude body1="tool" body2="right"/>
+    </contact>
+    <actuator>
+      <position joint="base_yaw" kp="100" kv="5" forcerange="-12 12"/>
+      <position joint="shoulder_pitch" kp="160" kv="7" forcerange="-16 16"/>
+      <position joint="elbow_pitch" kp="110" kv="5" forcerange="-10 10"/>
+      <position joint="wrist_pitch" kp="30" kv="1.5" forcerange="-4 4"/>
+      <position joint="wrist_roll" kp="30" kv="1.5" forcerange="-4 4"/>
+      <position joint="tool_yaw" kp="12" kv=".36" forcerange="-1 1"/>
+      <position joint="left_jaw" kp="480" kv="3" forcerange="-9 9"/>
+      <position joint="right_jaw" kp="480" kv="3" forcerange="-9 9"/>
+      ${loading ? '<position joint="latch_slide" kp="260" kv="2" forcerange="-7 0"/>' : ""}
+    </actuator>
+    <sensor>
+      <force site="wrist_sensor"/>
+      <torque site="wrist_sensor"/>
+    </sensor>
+  </mujoco>`;
+}
+
+export async function loadPhysics(wasm?: string) {
+  return loadMuJoCo(wasm ? { locateFile: () => wasm } : undefined);
+}
+
+export class Simulation {
+  readonly model;
+  readonly data;
+  private readonly target = [0, -0.09, 0.155, 0, 0.046, 0.046, 0, 0];
+  private readonly fingers: number[];
+  private readonly piece: number;
+  private readonly tool: number;
+  private readonly fixture: number;
+  private readonly pieceGeoms: number[];
+  private readonly armGeoms: Set<number>;
+  private readonly bias: number[];
+  /** The empty gripper's weight and the height of its center of mass along the tool axis. */
+  private readonly tare: { weight: number; arm: number };
+  private relativeGrip?: number[];
+  private gripSlip = false;
+  private stopReason: StopReason = "idle";
+  private guardReading?: { threshold_n: number; peak_n: number };
+  private shifted = false;
+  private stageTicks = 0;
+  private opened = false;
+  private openedDuringRelease = false;
+  private unlatched = false;
+  private latchArmed = true;
+  private readonly machinePosition?: { cover: number; latch: number; button: number };
+  private tracking = false;
+  private released = true;
+  private stableTicks = 0;
+  tick = 0;
+  moves = 0;
+  ended = false;
+  declared = false;
+  stoppedShort = false;
+
+  constructor(
+    private readonly mj: MainModule,
+    readonly layout: Layout,
+  ) {
+    this.bias = positionBias(layout);
+    this.model = mj.MjModel.from_xml_string(scene(layout));
+    this.data = new mj.MjData(this.model);
+    const geom = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_GEOM.value, name);
+    const body = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_BODY.value, name);
+    this.fingers = [geom("left_finger"), geom("right_finger")];
+    this.pieceGeoms = [
+      geom("shoulder"),
+      geom("shaft"),
+      geom("key"),
+      geom("workpiece"),
+      geom("cover_handle"),
+      geom("latch_button"),
+    ].filter((id) => id >= 0);
+    this.piece = body("piece");
+    this.tool = body("tool");
+    this.fixture = body("fixture");
+    const firstArmBody = body("base");
+    const lastArmBody = body("right");
+    this.armGeoms = new Set(
+      Array.from(this.model.geom_bodyid as Int32Array).flatMap((id, geom) =>
+        id >= firstArmBody && id <= lastArmBody ? [geom] : [],
+      ),
+    );
+    if (layout.task === "machine") {
+      const joint = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_JOINT.value, name);
+      this.machinePosition = {
+        cover: this.model.jnt_qposadr[joint("cover_slide")],
+        latch: this.model.jnt_qposadr[joint("latch_slide")],
+        button: geom("latch_button"),
+      };
+    }
+    for (let i = 0; i < 3; i++) this.target[i] += this.bias[i];
+    const initial = armTargets(this.target).positions;
+    this.data.qpos.set(initial);
+    this.data.ctrl.set(initial);
+    this.advance(120);
+    const { subtree_com: com, xpos, xmat } = this.data;
+    const [p, m] = [this.tool * 3, this.tool * 9];
+    this.tare = {
+      weight: this.model.body_subtreemass[this.tool] * gravity,
+      arm: [0, 1, 2].reduce((sum, i) => sum + (com[p + i] - xpos[p + i]) * xmat[m + 3 * i + 2], 0),
+    };
+  }
+
+  dispose() {
+    this.data.delete();
+    this.model.delete();
+  }
+
+  private contact() {
+    const touched = [false, false];
+    const workpiece = [false, false];
+    let button = false;
+    let armContact = false;
+    const contacts = this.data.contact;
+    for (let index = 0; index < this.data.ncon; index++) {
+      const pair = contacts.get(index);
+      if (!pair) continue;
+      if (pair.efc_address >= 0) {
+        armContact ||= this.armGeoms.has(pair.geom1) !== this.armGeoms.has(pair.geom2);
+        for (const [finger, id] of this.fingers.entries()) {
+          const counterpart = pair.geom1 === id ? pair.geom2 : pair.geom2 === id ? pair.geom1 : -1;
+          touched[finger] ||= this.pieceGeoms.includes(counterpart);
+          workpiece[finger] ||= this.model.geom_bodyid[counterpart] === this.piece;
+          button ||= counterpart === this.machinePosition?.button;
+        }
+      }
+      pair.delete();
+    }
+    contacts.delete();
+    return {
+      fingers: { left: touched[0], right: touched[1] },
+      button,
+      armContact,
+      holdingPiece: workpiece.every(Boolean),
+    };
+  }
+
+  private sampleGrip() {
+    if (this.released) {
+      this.relativeGrip = undefined;
+      return;
+    }
+    const { xpos, xmat } = this.data;
+    const p = this.piece * 3;
+    const w = this.tool * 3;
+    const m = this.tool * 9;
+    const [x, y, z] = [xpos[p] - xpos[w], xpos[p + 1] - xpos[w + 1], xpos[p + 2] - xpos[w + 2]];
+    if (!this.relativeGrip && Math.hypot(x, y, z) > 0.07) return;
+    const { holdingPiece } = this.contact();
+    const local = [0, 1, 2].map((i) => x * xmat[m + i] + y * xmat[m + 3 + i] + z * xmat[m + 6 + i]);
+    const previous = this.relativeGrip;
+    if (previous && (!holdingPiece || Math.hypot(...local.map((v, i) => v - previous[i])) > 0.003)) {
+      this.gripSlip = true;
+    }
+    if (!holdingPiece) this.relativeGrip = undefined;
+    else if (!previous) this.relativeGrip = local;
+  }
+
+  private wristWrench() {
+    const { sensordata: sensor, xmat } = this.data;
+    const m = this.tool * 9;
+    const world = (offset: number, axis: number) => {
+      const row = m + 3 * axis;
+      return (
+        xmat[row] * sensor[offset] + xmat[row + 1] * sensor[offset + 1] + xmat[row + 2] * sensor[offset + 2]
+      );
+    };
+    // Remove the empty gripper's weight and gravity moment. Loads and contacts remain.
+    const { weight } = this.tare;
+    const gravityMoment = weight * this.tare.arm;
+    return {
+      force: [-world(0, 0), -world(0, 1), weight - world(0, 2)],
+      torque: [
+        gravityMoment * xmat[m + 5] - world(3, 0),
+        -gravityMoment * xmat[m + 2] - world(3, 1),
+        -world(3, 2),
+      ],
+    };
+  }
+
+  get moveBudget() {
+    return this.machinePosition ? machineBudget : budget;
+  }
+
+  private updateMachine() {
+    if (!this.machinePosition) return;
+    const { qpos, ctrl, xpos, xmat } = this.data;
+    const cover = qpos[this.machinePosition.cover];
+    const latch = qpos[this.machinePosition.latch];
+    if (cover > 0.087) {
+      this.opened = true;
+      this.openedDuringRelease = true;
+    }
+    if (!this.unlatched && latch > -0.004) this.latchArmed = true;
+    if (this.latchArmed && latch <= -machine.releaseTravel) {
+      this.unlatched = true;
+      this.latchArmed = false;
+    }
+    if (this.unlatched && this.openedDuringRelease && cover < 0.002) {
+      this.unlatched = false;
+      this.openedDuringRelease = false;
+    }
+    ctrl[motorCount] = this.unlatched ? -machine.latchTravel : 0;
+    const p = this.piece * 3;
+    if (this.stageTicks < 125) {
+      const settledOnEdge =
+        this.released &&
+        Math.abs(xpos[p] - machine.cradleX) < 0.004 &&
+        Math.abs(xpos[p + 1] - machine.cradleY) < 0.01 &&
+        Math.abs(xpos[p + 2] - 0.042) < 0.003 &&
+        Math.abs(xmat[this.piece * 9 + 2]) > 0.97 &&
+        this.pieceStill();
+      this.stageTicks = settledOnEdge ? this.stageTicks + 1 : 0;
+    }
+  }
+
+  private pieceStill() {
+    const v = this.data.qvel;
+    const start = motorCount;
+    return (
+      Math.hypot(v[start], v[start + 1], v[start + 2]) < 0.009 &&
+      Math.hypot(v[start + 3], v[start + 4], v[start + 5]) < 0.2
+    );
+  }
+
+  private machineSeating() {
+    const { xpos, xmat } = this.data;
+    const p = this.piece * 3;
+    const m = this.piece * 9;
+    return {
+      centered: Math.abs(xpos[p] - machine.loadX) < 0.005 && Math.abs(xpos[p + 1] - machine.loadY) < 0.009,
+      at_slot_floor: Math.abs(xpos[p + 2] - 0.022) < 0.003,
+      on_edge_and_aligned: Math.abs(xmat[m + 2]) > 0.97 && Math.abs(xmat[m + 4]) > 0.98,
+    };
+  }
+
+  private machineChecks() {
+    if (!this.machinePosition) return undefined;
+    const { cover, latch } = this.machinePosition;
+    return {
+      cradle_settled: this.stageTicks >= 125,
+      cover_opened: this.opened,
+      part_released: this.released,
+      part_seated: Object.values(this.machineSeating()).every(Boolean),
+      cover_closed: this.data.qpos[cover] < 0.003,
+      latch_engaged: this.data.qpos[latch] > -0.004,
+    };
+  }
+
+  private seated() {
+    const machineChecks = this.machineChecks();
+    if (machineChecks) return Object.values(machineChecks).every(Boolean) && this.pieceStill();
+
+    const { xpos, xmat } = this.data;
+    const piece = this.piece * 3;
+    const fixture = this.fixture * 3;
+    const orientation = this.piece * 9;
+    const fixtureOrientation = this.fixture * 9;
+    const dx = xpos[piece] - xpos[fixture];
+    const dy = xpos[piece + 1] - xpos[fixture + 1];
+    const localX = dx * xmat[fixtureOrientation] + dy * xmat[fixtureOrientation + 3];
+    const localY = dx * xmat[fixtureOrientation + 1] + dy * xmat[fixtureOrientation + 4];
+    const axisDot =
+      xmat[orientation] * xmat[fixtureOrientation] + xmat[orientation + 3] * xmat[fixtureOrientation + 3];
+    const aligned = (this.layout.task === "keyed" ? axisDot : Math.abs(axisDot)) > Math.cos(6 * radians);
+    if (
+      !this.released ||
+      !this.pieceStill() ||
+      xmat[orientation + 8] < 0.99 ||
+      Math.abs(xpos[piece + 2] - 0.004) > 0.002
+    ) {
+      return false;
+    }
+    if (this.layout.task === "block") return Math.abs(localX) < 0.01 && Math.abs(localY) < 0.01;
+    return Math.abs(localX) < 0.003 && Math.abs(localY) < 0.003 && aligned;
+  }
+
+  private advance(steps: number, stop?: () => boolean) {
+    let interrupted = false;
+    for (let i = 0; i < steps; i++) {
+      this.mj.mj_step(this.model, this.data);
+      this.tick++;
+      this.updateMachine();
+      if (this.tracking) this.stableTicks = this.seated() ? this.stableTicks + 1 : 0;
+      if (stop?.()) {
+        interrupted = true;
+        break;
+      }
+    }
+    this.mj.mj_forward(this.model, this.data);
+    return interrupted;
+  }
+
+  private drive(target: number[]) {
+    const solution = armTargets(target, this.data.ctrl);
+    this.data.ctrl.set(solution.positions);
+    return solution;
+  }
+
+  private guardedMove(start: number[], guard: Guard, sample?: () => void) {
+    const baseline = this.wristWrench().force;
+    const end = [...this.target];
+    const translation = end.slice(0, 3).map((value, index) => value - start[index]);
+    const distance = Math.hypot(...translation);
+    const rotationSeconds = Math.max(...[3, 6, 7].map((i) => Math.abs(end[i] - start[i]))) / (45 * radians);
+    const stepSeconds = 0.02;
+    const steps = Math.max(
+      1,
+      Math.ceil(Math.max((distance * 1000) / guard.speed_mm_s, rotationSeconds) / stepSeconds),
+    );
+    const allowedSteps = Math.min(steps, Math.round(guardSeconds / stepSeconds));
+    const reading = { threshold_n: guard.force_n, peak_n: 0 };
+    this.guardReading = reading;
+    let goal = start;
+    const overThreshold = () => {
+      const force = this.wristWrench().force;
+      const added = Math.hypot(...force.map((value, index) => value - baseline[index]));
+      reading.peak_n = Math.max(reading.peak_n, added);
+      return added >= guard.force_n;
+    };
+    const settleSteps = steps <= allowedSteps ? 22 : 0;
+    let triggered = false;
+    for (let step = 1; step <= allowedSteps + settleSteps; step++) {
+      if (step <= allowedSteps) {
+        goal = end.map((value, index) => start[index] + ((value - start[index]) * step) / steps);
+        this.drive(goal);
+      }
+      triggered = this.advance(10, overThreshold);
+      this.sampleGrip();
+      if (step % Math.max(3, Math.ceil(allowedSteps / 20)) === 0) sample?.();
+      if (triggered) break;
+    }
+
+    if (!triggered && steps <= allowedSteps) return;
+    const pose = this.toolPose();
+    for (let index = 0; index < 3; index++) {
+      const retreat = triggered && distance > 0 ? (translation[index] / distance) * 0.002 : 0;
+      goal[index] = pose[index] - retreat;
+    }
+    this.target.splice(0, this.target.length, ...goal);
+    this.drive(this.target);
+    this.advance(settleSteps);
+    this.sampleGrip();
+    return triggered ? "force_limit" : "time_limit";
+  }
+
+  act(command: Command, sample?: () => void) {
+    if (this.ended) throw new Error("This run has ended.");
+    const start = [...this.target];
+    this.moves++;
+    this.stoppedShort = false;
+    this.guardReading = undefined;
+    this.relativeGrip = undefined;
+    this.sampleGrip();
+    this.gripSlip = false;
+    if (command.type === "grip") {
+      this.released = command.state === "open";
+      const offset = this.layout.calibration ? (seededUnit(this.layout.seed, 143) - 0.5) * 0.001 : 0;
+      this.target[4] = this.released ? 0.046 : 0.011 + offset;
+      this.target[5] = this.released ? 0.046 : 0.011 - offset;
+    } else {
+      this.target[0] = command.x_mm / 1000 + this.bias[0];
+      this.target[1] = command.y_mm / 1000 + this.bias[1];
+      this.target[2] = command.z_mm / 1000 + this.bias[2];
+      this.target[3] += angleDelta(command.yaw_deg * radians, this.target[3]);
+      this.target[6] = (command.pitch_deg ?? 0) * radians;
+      this.target[7] = (command.roll_deg ?? 0) * radians;
+    }
+    this.tracking = true;
+    this.stableTicks = 0;
+    let guardStop: StopReason | undefined;
+    if (command.type === "move_to" && command.guard) {
+      const pose = this.toolPose();
+      for (let axis = 0; axis < 3; axis++) start[axis] = pose[axis];
+      guardStop = this.guardedMove(start, command.guard, sample);
+    } else {
+      // Ramp targets to limit accelerations during a grasp.
+      for (let frame = 1; frame <= 45; frame++) {
+        const t = frame / 45;
+        const blend = t * t * (3 - 2 * t);
+        this.drive(this.target.map((goal, index) => start[index] + (goal - start[index]) * blend));
+        this.advance(10);
+        this.sampleGrip();
+        if (frame % 3 === 0) sample?.();
+      }
+      this.advance(settleSteps);
+      this.sampleGrip();
+    }
+    this.stopReason = "grip_complete";
+    if (command.type === "move_to") {
+      const [x, y, z] = this.toolPose();
+      const desired = rotation(this.target[3], this.target[6], this.target[7]);
+      const actual = this.data.xmat;
+      const trace = desired.reduce((dot, entry, i) => dot + entry * actual[this.tool * 9 + i], 0);
+      const solution = armTargets(this.target, this.data.ctrl);
+      this.stoppedShort =
+        Boolean(guardStop) ||
+        Math.hypot(x - this.target[0], y - this.target[1], z - this.target[2]) > 0.003 ||
+        trace < 1 + 2 * Math.cos(5 * radians);
+      this.stopReason =
+        guardStop ??
+        (solution.unreachable
+          ? "unreachable"
+          : solution.limited
+            ? "joint_limit"
+            : !this.stoppedShort
+              ? "target_reached"
+              : this.contact().armContact
+                ? "blocked_by_contact"
+                : "position_error");
+    }
+    if (
+      !this.machinePosition &&
+      this.layout.shift &&
+      !this.shifted &&
+      this.data.xpos[this.piece * 3 + 2] > 0.065
+    ) {
+      const { fingers } = this.contact();
+      if (fingers.left && fingers.right) {
+        this.shifted = true;
+        this.data.mocap_pos[1] += 0.012;
+        const angle = ((this.layout.angle + 9) * radians) / 2;
+        this.data.mocap_quat.set([Math.cos(angle), 0, 0, Math.sin(angle)]);
+        this.advance(20);
+      }
+    }
+    if (this.moves === this.moveBudget) this.ended = true;
+  }
+
+  get success() {
+    return this.stableTicks >= 125 && this.seated();
+  }
+
+  private toolPose() {
+    const p = this.tool * 3;
+    const m = this.tool * 9;
+    const { xpos, xmat } = this.data;
+    const horizontal = Math.hypot(xmat[m], xmat[m + 3]);
+    const singular = horizontal < 0.001;
+    return [
+      xpos[p],
+      xpos[p + 1],
+      xpos[p + 2],
+      singular ? Math.atan2(-xmat[m + 1], xmat[m + 4]) : Math.atan2(xmat[m + 3], xmat[m]),
+      Math.atan2(-xmat[m + 6], horizontal),
+      singular ? 0 : Math.atan2(xmat[m + 7], xmat[m + 8]),
+    ];
+  }
+
+  readings() {
+    const [x, y, z, yaw, pitch, roll] = this.toolPose();
+    const q = this.data.qpos;
+    const checks = this.ended ? this.machineChecks() : undefined;
+    const { fingers, button, holdingPiece } = this.contact();
+    const wrench = this.wristWrench();
+    const round = (value: number, scale: number) => Math.round(value * scale) / scale;
+    const vector = (values: number[], scale: number) => ({
+      x: round(values[0], scale),
+      y: round(values[1], scale),
+      z: round(values[2], scale),
+    });
+    const effort = this.data.actuator_force;
+    return {
+      tick: this.tick,
+      moves_remaining: this.moveBudget - this.moves,
+      x_mm: round((x - this.bias[0]) * 1000, 10),
+      y_mm: round((y - this.bias[1]) * 1000, 10),
+      z_mm: round((z - this.bias[2]) * 1000, 10),
+      yaw_deg: Math.round(yaw / radians),
+      pitch_deg: Math.round(pitch / radians),
+      roll_deg: Math.round(roll / radians),
+      jaw_width_mm: Math.round((q[armJoints] + q[armJoints + 1] - 0.008) * 1000),
+      finger_contact: fingers,
+      wrist_force_n: vector(wrench.force, 100),
+      wrist_torque_nm: vector(wrench.torque, 1000),
+      gripper: {
+        left_effort_n: round(Math.abs(effort[armJoints]), 10),
+        right_effort_n: round(Math.abs(effort[armJoints + 1]), 10),
+        workpiece_between_jaws: holdingPiece,
+        slip_detected: this.gripSlip,
+      },
+      controller: {
+        stop_reason: this.stopReason,
+        joints: jointLimits.map(({ name, min, max }, index) => {
+          const angle = round(q[index] / radians, 10);
+          return {
+            name,
+            angle_deg: angle,
+            min_deg: min,
+            max_deg: max,
+            at_limit: angle <= min + 0.5 || angle >= max - 0.5,
+          };
+        }),
+        ...(this.guardReading && {
+          guard: { ...this.guardReading, peak_n: round(this.guardReading.peak_n, 100) },
+        }),
+      },
+      ...(this.machinePosition && {
+        latch: {
+          depression_mm: Math.max(0, Math.round(-q[this.machinePosition.latch] * 10000) / 10),
+          release_travel_mm: machine.releaseTravel * 1000,
+          finger_contact: button,
+          unlocked: this.unlatched,
+        },
+      }),
+      stopped_short: this.stoppedShort,
+      ended: this.ended,
+      ...(this.ended && { success: this.success, declared: this.declared }),
+      ...(checks && {
+        checks: { ...checks, seating: this.machineSeating(), all_conditions_held_for_250ms: this.success },
+      }),
+    };
+  }
+
+  finish() {
+    if (!this.ended) {
+      this.ended = true;
+      this.declared = true;
+    }
+  }
+}
