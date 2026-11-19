@@ -303,13 +303,11 @@ async function start(id: string) {
       pitch_deg,
       roll_deg,
       jaw_width_mm,
-      finger_contact,
       stopped_short,
       moves_remaining,
       ended,
       success,
       checks,
-      latch,
       wrist_force_n,
       wrist_torque_nm,
       gripper,
@@ -325,7 +323,6 @@ async function start(id: string) {
       `XYZ  ${x_mm}, ${y_mm}, ${z_mm} mm`,
       `Yaw  ${yaw_deg}°   Pitch  ${pitch_deg}°   Roll  ${roll_deg}°`,
       `Jaw  ${jaw_width_mm} mm`,
-      `Contact  L ${finger_contact.left ? "yes" : "–"}  R ${finger_contact.right ? "yes" : "–"}`,
       `Moves left  ${moves_remaining}`,
     ];
     if (wrist_force_n && wrist_torque_nm && gripper && controller) {
@@ -333,8 +330,7 @@ async function start(id: string) {
       lines.push(
         `Force XYZ  ${xyz(wrist_force_n)} N`,
         `Torque XYZ  ${xyz(wrist_torque_nm)} N·m`,
-        `Jaw effort L/R  ${gripper.left_effort_n}/${gripper.right_effort_n} N`,
-        `Slip  ${gripper.slip_detected ? "detected" : "–"}`,
+        `Grip effort  ${gripper.effort_n} N · object ${gripper.object_detected ? "detected" : "–"}`,
         `Controller  ${controller.stop_reason.replaceAll("_", " ")}`,
       );
       if (controller.guard) lines.push(`Guard peak  ${controller.guard.peak_n} N`);
@@ -349,12 +345,6 @@ async function start(id: string) {
         )
         .join("\n") ?? "";
     const yn = (value: boolean) => (value ? "yes" : "no");
-    if (latch) {
-      lines.push(
-        `Latch  ${latch.unlocked ? "unlocked" : "locked"} · ${latch.depression_mm} mm down`,
-        `Button contact  ${yn(latch.finger_contact)}`,
-      );
-    }
     if (checks) {
       lines.push(
         "",
@@ -468,7 +458,7 @@ async function start(id: string) {
         success_criteria: puzzle[sim.layout.task].criteria,
         axes: "Overhead: +X right, +Y up. +Z is height above the table. Positive yaw rotates counterclockwise above +X. Pitch and roll are optional local Y and X rotations after yaw. Zero pitch and roll point the fingers down. Use mm and degrees. Z is the wrist's gripper target, 7 mm below the finger center.",
         feedback:
-          "Wrist force (N) and torque (N·m) are in world XYZ and tared for the empty tool. Gripper effort and slip are reported after each command. Joint readings report controller angles and limits.",
+          "Wrist force (N) and torque (N·m) are in world XYZ and tared for the empty tool. The gripper reports jaw width, motor effort, and object_detected when the closing jaws stall on something before reaching their closed position. Joint readings report controller angles and limits. Numerical readings are fresh even if the image is stale.",
         guarded_move: `Optional move_to guard: {force_n, speed_mm_s}. Moves slowly and stops and backs away when the wrist-force vector changes by force_n N relative to the start of the move. Guarded motion is limited to ${guardSeconds} seconds of travel per action.`,
         calibration_error_enabled: Boolean(layout.calibration),
         budget: sim.moveBudget,
@@ -478,7 +468,7 @@ async function start(id: string) {
         info.inspection_camera =
           "Use observe with camera inspection to check that the part is flush with the slot floor before closing the cover. This view looks into the front of the machine below the rails.";
         info.latch_controls =
-          "Use closed jaws with the fingers pointing down. Center them over the button and lower Z in small steps. The latch reading reports button contact and depression. Once unlocked is true, lift clear and grab the cover handle. Numerical readings are fresh even if the image is stale.";
+          "Use closed jaws with the fingers pointing down. Center them over the red button and press it down. A full press releases the cover and the button stays down on its own.";
       }
     }
     return { info, image: imageFrame.images[camera]?.split(",")[1] };

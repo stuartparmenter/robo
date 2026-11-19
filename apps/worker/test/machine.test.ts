@@ -64,7 +64,7 @@ test("pressing the latch again after loading fails only the final latch and sett
   }
 });
 
-test("a partial press reports contact and a full press reports that the cover is unlocked", () => {
+test("pressing the latch is felt through the wrist sensor and a full press leaves it down", () => {
   const sim = new Simulation(mj, first);
   try {
     const [hover, close, press, lift] = machineRoute(first);
@@ -72,14 +72,12 @@ test("a partial press reports contact and a full press reports that the cover is
     sim.act(hover);
     sim.act(close);
     sim.act({ ...press, z_mm: 112 });
-    const partial = sim.readings().latch;
-    expect(partial).toMatchObject({ finger_contact: true, unlocked: false, release_travel_mm: 20 });
-    expect(partial?.depression_mm).toBeGreaterThan(0);
-    expect(partial?.depression_mm).toBeLessThan(20);
+    expect(sim.readings().wrist_force_n.z).toBeGreaterThan(0.1);
+    expect(sim.readings()).not.toHaveProperty("latch");
     sim.act(press);
-    expect(sim.readings().latch?.unlocked).toBe(true);
     sim.act(lift);
-    expect(sim.readings().latch).toMatchObject({ finger_contact: false, unlocked: true });
+    sim.finish();
+    expect(sim.readings().checks?.latch_engaged).toBe(false);
   } finally {
     sim.dispose();
   }

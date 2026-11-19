@@ -27,13 +27,12 @@ test("a guarded press stops and backs off at the specified change in force", () 
     expect(r.wrist_force_n.z).toBeGreaterThan(0.1);
     expect(Math.abs(r.wrist_torque_nm.x) + Math.abs(r.wrist_torque_nm.y)).toBeGreaterThan(0);
     expect(r.z_mm).toBeGreaterThan(press.z_mm);
-    expect(r.latch?.unlocked).toBe(true);
   } finally {
     sim.dispose();
   }
 });
 
-test("jaw effort, slip, and arm stop reason reflect a held peg sliding against the table", () => {
+test("grip effort, object detection, and arm stop reason reflect a held peg pressed into the table", () => {
   const sim = new Simulation(mj, layout);
   try {
     const { x, y, yaw } = layoutGeometry(layout);
@@ -43,15 +42,15 @@ test("jaw effort, slip, and arm stop reason reflect a held peg sliding against t
     sim.act({ type: "grip", state: "close" });
     moveTo(120);
     const lifted = sim.readings();
-    expect(lifted.gripper.left_effort_n).toBeGreaterThan(1);
-    expect(lifted.gripper).toMatchObject({ workpiece_between_jaws: true, slip_detected: false });
+    expect(lifted.gripper.effort_n).toBeGreaterThan(1);
+    expect(lifted.gripper.object_detected).toBe(true);
     expect(lifted.wrist_force_n.z).toBeLessThan(0);
     expect(lifted.controller.joints).toHaveLength(6);
 
     moveTo(18);
     const stalled = sim.readings();
-    expect(stalled.gripper.slip_detected).toBe(true);
-    expect(stalled.controller.stop_reason).toBe("blocked_by_contact");
+    expect(stalled.stopped_short).toBe(true);
+    expect(stalled.controller.stop_reason).toBe("position_error");
   } finally {
     sim.dispose();
   }

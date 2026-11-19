@@ -46,7 +46,6 @@ type StopReason =
   | "force_limit"
   | "joint_limit"
   | "unreachable"
-  | "blocked_by_contact"
   | "position_error"
   | "time_limit"
   | "grip_complete";
@@ -265,12 +264,9 @@ export class Simulation {
   private readonly tool: number;
   private readonly fixture: number;
   private readonly pieceGeoms: number[];
-  private readonly armGeoms: Set<number>;
   private readonly bias: number[];
   /** The empty gripper's weight and the height of its center of mass along the tool axis. */
   private readonly tare: { weight: number; arm: number };
-  private relativeGrip?: number[];
-  private gripSlip = false;
   private stopReason: StopReason = "idle";
   private guardReading?: { threshold_n: number; peak_n: number };
   private shifted = false;
@@ -279,7 +275,7 @@ export class Simulation {
   private openedDuringRelease = false;
   private unlatched = false;
   private latchArmed = true;
-  private readonly machinePosition?: { cover: number; latch: number; button: number };
+  private readonly machinePosition?: { cover: number; latch: number };
   private tracking = false;
   private released = true;
   private stableTicks = 0;
@@ -310,19 +306,11 @@ export class Simulation {
     this.piece = body("piece");
     this.tool = body("tool");
     this.fixture = body("fixture");
-    const firstArmBody = body("base");
-    const lastArmBody = body("right");
-    this.armGeoms = new Set(
-      Array.from(this.model.geom_bodyid as Int32Array).flatMap((id, geom) =>
-        id >= firstArmBody && id <= lastArmBody ? [geom] : [],
-      ),
-    );
     if (layout.task === "machine") {
       const joint = (name: string) => mj.mj_name2id(this.model, mj.mjtObj.mjOBJ_JOINT.value, name);
       this.machinePosition = {
         cover: this.model.jnt_qposadr[joint("cover_slide")],
         latch: this.model.jnt_qposadr[joint("latch_slide")],
-        button: geom("latch_button"),
       };
     }
     for (let i = 0; i < 3; i++) this.target[i] += this.bias[i];
@@ -345,20 +333,14 @@ export class Simulation {
 
   private contact() {
     const touched = [false, false];
-    const workpiece = [false, false];
-    let button = false;
-    let armContact = false;
     const contacts = this.data.contact;
     for (let index = 0; index < this.data.ncon; index++) {
       const pair = contacts.get(index);
       if (!pair) continue;
       if (pair.efc_address >= 0) {
-        armContact ||= this.armGeoms.has(pair.geom1) !== this.armGeoms.has(pair.geom2);
         for (const [finger, id] of this.fingers.entries()) {
           const counterpart = pair.geom1 === id ? pair.geom2 : pair.geom2 === id ? pair.geom1 : -1;
           touched[finger] ||= this.pieceGeoms.includes(counterpart);
-          workpiece[finger] ||= this.model.geom_bodyid[counterpart] === this.piece;
-          button ||= counterpart === this.machinePosition?.button;
         }
       }
       pair.delete();
@@ -366,31 +348,7 @@ export class Simulation {
     contacts.delete();
     return {
       fingers: { left: touched[0], right: touched[1] },
-      button,
-      armContact,
-      holdingPiece: workpiece.every(Boolean),
     };
-  }
-
-  private sampleGrip() {
-    if (this.released) {
-      this.relativeGrip = undefined;
-      return;
-    }
-    const { xpos, xmat } = this.data;
-    const p = this.piece * 3;
-    const w = this.tool * 3;
-    const m = this.tool * 9;
-    const [x, y, z] = [xpos[p] - xpos[w], xpos[p + 1] - xpos[w + 1], xpos[p + 2] - xpos[w + 2]];
-    if (!this.relativeGrip && Math.hypot(x, y, z) > 0.07) return;
-    const { holdingPiece } = this.contact();
-    const local = [0, 1, 2].map((i) => x * xmat[m + i] + y * xmat[m + 3 + i] + z * xmat[m + 6 + i]);
-    const previous = this.relativeGrip;
-    if (previous && (!holdingPiece || Math.hypot(...local.map((v, i) => v - previous[i])) > 0.003)) {
-      this.gripSlip = true;
-    }
-    if (!holdingPiece) this.relativeGrip = undefined;
-    else if (!previous) this.relativeGrip = local;
   }
 
   private wristWrench() {
@@ -563,7 +521,6 @@ export class Simulation {
         this.drive(goal);
       }
       triggered = this.advance(10, overThreshold);
-      this.sampleGrip();
       if (step % Math.max(3, Math.ceil(allowedSteps / 20)) === 0) sample?.();
       if (triggered) break;
     }
@@ -577,7 +534,6 @@ export class Simulation {
     this.target.splice(0, this.target.length, ...goal);
     this.drive(this.target);
     this.advance(settleSteps);
-    this.sampleGrip();
     return triggered ? "force_limit" : "time_limit";
   }
 
@@ -587,9 +543,6 @@ export class Simulation {
     this.moves++;
     this.stoppedShort = false;
     this.guardReading = undefined;
-    this.relativeGrip = undefined;
-    this.sampleGrip();
-    this.gripSlip = false;
     if (command.type === "grip") {
       this.released = command.state === "open";
       const offset = this.layout.calibration ? (seededUnit(this.layout.seed, 143) - 0.5) * 0.001 : 0;
@@ -617,11 +570,9 @@ export class Simulation {
         const blend = t * t * (3 - 2 * t);
         this.drive(this.target.map((goal, index) => start[index] + (goal - start[index]) * blend));
         this.advance(10);
-        this.sampleGrip();
         if (frame % 3 === 0) sample?.();
       }
       this.advance(settleSteps);
-      this.sampleGrip();
     }
     this.stopReason = "grip_complete";
     if (command.type === "move_to") {
@@ -640,11 +591,9 @@ export class Simulation {
           ? "unreachable"
           : solution.limited
             ? "joint_limit"
-            : !this.stoppedShort
-              ? "target_reached"
-              : this.contact().armContact
-                ? "blocked_by_contact"
-                : "position_error");
+            : this.stoppedShort
+              ? "position_error"
+              : "target_reached");
     }
     if (
       !this.machinePosition &&
@@ -688,7 +637,6 @@ export class Simulation {
     const [x, y, z, yaw, pitch, roll] = this.toolPose();
     const q = this.data.qpos;
     const checks = this.ended ? this.machineChecks() : undefined;
-    const { fingers, button, holdingPiece } = this.contact();
     const wrench = this.wristWrench();
     const round = (value: number, scale: number) => Math.round(value * scale) / scale;
     const vector = (values: number[], scale: number) => ({
@@ -697,6 +645,7 @@ export class Simulation {
       z: round(values[2], scale),
     });
     const effort = this.data.actuator_force;
+    const jawWidth = q[armJoints] + q[armJoints + 1];
     return {
       tick: this.tick,
       moves_remaining: this.moveBudget - this.moves,
@@ -706,15 +655,13 @@ export class Simulation {
       yaw_deg: Math.round(yaw / radians),
       pitch_deg: Math.round(pitch / radians),
       roll_deg: Math.round(roll / radians),
-      jaw_width_mm: Math.round((q[armJoints] + q[armJoints + 1] - 0.008) * 1000),
-      finger_contact: fingers,
+      jaw_width_mm: Math.round((jawWidth - 0.008) * 1000),
       wrist_force_n: vector(wrench.force, 100),
       wrist_torque_nm: vector(wrench.torque, 1000),
       gripper: {
-        left_effort_n: round(Math.abs(effort[armJoints]), 10),
-        right_effort_n: round(Math.abs(effort[armJoints + 1]), 10),
-        workpiece_between_jaws: holdingPiece,
-        slip_detected: this.gripSlip,
+        // A single-actuator gripper reports one motor effort and whether the jaws stalled on an object.
+        effort_n: round((Math.abs(effort[armJoints]) + Math.abs(effort[armJoints + 1])) / 2, 10),
+        object_detected: !this.released && jawWidth > this.target[4] + this.target[5] + 0.001,
       },
       controller: {
         stop_reason: this.stopReason,
@@ -732,14 +679,6 @@ export class Simulation {
           guard: { ...this.guardReading, peak_n: round(this.guardReading.peak_n, 100) },
         }),
       },
-      ...(this.machinePosition && {
-        latch: {
-          depression_mm: Math.max(0, Math.round(-q[this.machinePosition.latch] * 10000) / 10),
-          release_travel_mm: machine.releaseTravel * 1000,
-          finger_contact: button,
-          unlocked: this.unlatched,
-        },
-      }),
       stopped_short: this.stoppedShort,
       ended: this.ended,
       ...(this.ended && { success: this.success, declared: this.declared }),

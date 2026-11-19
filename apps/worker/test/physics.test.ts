@@ -16,9 +16,9 @@ function exercise(
     move(x, y, 120, yaw);
     move(x, y, layout.task === "block" ? 18 : 44, yaw);
     sim.act({ type: "grip", state: "close" });
-    expect(sim.readings().finger_contact).toEqual({ left: true, right: true });
+    expect(sim.readings().gripper.object_detected).toBe(true);
     move(x, y, 120, yaw);
-    expect(sim.readings().finger_contact).toEqual({ left: true, right: true });
+    expect(sim.readings().gripper.object_detected).toBe(true);
     run(sim, move);
   } finally {
     sim.dispose();

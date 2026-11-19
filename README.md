@@ -51,7 +51,7 @@ The Worker serves the page and the MCP endpoint. One Durable Object per session 
 
 ## Force and controller feedback
 
-MCP and frame telemetry report the world-XYZ wrist force in newtons and torque in newton-metres, tared for the empty gripper. The readings include payload and contact effects. Gripper telemetry reports left and right actuator effort and flags when a held workpiece slides or loses bilateral contact. Controller telemetry includes angles, limits, and the reason the last move stopped.
+MCP and frame telemetry report the world-XYZ wrist force in newtons and torque in newton-metres, tared for the empty gripper. The readings include payload and contact effects. Gripper telemetry reports jaw width, a single motor effort, and `object_detected` when the closing jaws stall before their closed position, as a typical electric parallel gripper does. Controller telemetry includes angles, limits, and the reason the last move stopped. Readings are limited to what a real arm, gripper and wrist sensor would provide: there is no tactile contact, slip detection, or latch state, so the agent infers these from the camera, jaw width and wrist force.
 
 Add `"guard":{"force_n":2,"speed_mm_s":25}` to a `move_to`, or use **Stop on force** in manual controls. It moves at the requested speed for up to four seconds, monitors the change from its starting wrist force, and stops and backs away when the threshold is reached. The threshold triggers the simulated response and some force overshoot is possible.
 
