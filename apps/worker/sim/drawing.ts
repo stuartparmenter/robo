@@ -4,12 +4,13 @@ const width = 760;
 const height = 520;
 
 /** Render the work instruction's part drawing as a JPEG data URL. */
-export function drawWorkInstruction(revision: Revision) {
+export function drawWorkInstruction(revision: Revision, pixelRatio = 1) {
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = width * pixelRatio;
+  canvas.height = height * pixelRatio;
   const pen = canvas.getContext("2d");
   if (!pen) throw new Error("Canvas 2D is unavailable.");
+  pen.scale(pixelRatio, pixelRatio);
   const rev = revisions[revision];
   const ink = "#1d2327";
   pen.fillStyle = "#f4f1e8";
@@ -21,11 +22,12 @@ export function drawWorkInstruction(revision: Revision) {
   pen.font = "bold 20px monospace";
   pen.fillText(`WORK INSTRUCTION  ·  BRACKET BLANK  ·  REV ${revision}`, 30, 46);
   pen.font = "15px monospace";
-  pen.fillText("TOP VIEW (marked face up), RIGHT-HAND PART. 4 px = 1 mm.", 30, 72);
+  const scaleNote = pixelRatio === 1 ? " 4 px = 1 mm." : "";
+  pen.fillText(`TOP VIEW (marked face up), RIGHT-HAND PART.${scaleNote}`, 30, 72);
 
   // Top view: X across, Y up the page, scaled 4 px/mm and centred.
   const scale = 4000;
-  const cx = 230;
+  const cx = 192;
   const cy = 290;
   const w = partWidth * scale;
   const l = rev.nominal * scale;

@@ -32,8 +32,15 @@ h2 {
   font-size: 1rem;
   font-weight: 650;
 }
+h3 {
+  margin: 0;
+  font-size: 1rem;
+}
 p {
   line-height: 1.45;
+}
+a {
+  color: inherit;
 }
 header p,
 .hint,
@@ -97,24 +104,34 @@ button.primary {
   border-color: var(--accent);
   width: 100%;
 }
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(245px, 285px);
-  gap: 16px;
-  align-items: start;
-}
-.views {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-figure,
-aside section,
-.replay {
+.panel,
+figure {
   margin: 0;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 9px;
+}
+.panel {
+  padding: 15px;
+}
+.panel p {
+  margin: 0;
+}
+.panel p:empty,
+#history-message:empty {
+  display: none;
+}
+.views {
+  display: grid;
+  gap: 12px;
+}
+.observations {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));
+  align-items: start;
+  gap: 12px;
+}
+figure {
   overflow: hidden;
 }
 figcaption {
@@ -127,16 +144,11 @@ figure img {
   display: block;
   background: #152327;
 }
-#overhead {
+.views:has(#controls:enabled) #overhead {
   cursor: crosshair;
 }
-aside {
-  display: grid;
-  gap: 12px;
-}
-aside section,
-.replay {
-  padding: 15px;
+summary {
+  cursor: pointer;
 }
 fieldset {
   margin: 0;
@@ -146,7 +158,7 @@ fieldset {
 }
 .inputs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(min(100px, 100%), 1fr));
   gap: 9px;
   margin-bottom: 12px;
 }
@@ -164,9 +176,9 @@ fieldset {
 }
 #status {
   color: var(--accent);
-  font-size: 0.88rem;
 }
-#readings {
+#readings,
+#joint-readings {
   white-space: pre-wrap;
   line-height: 1.5;
   font-size: 0.78rem;
@@ -177,48 +189,36 @@ fieldset {
   width: 100%;
 }
 .replay {
-  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  grid-template-areas:
-    "heading play download"
-    "caption caption caption"
-    "slider slider slider";
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+.replay-header,
+.replay-actions {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
+}
+.replay-header {
+  justify-content: space-between;
   gap: 8px 12px;
 }
+.replay-actions {
+  gap: 6px;
+}
 .replay h2 {
-  grid-area: heading;
   margin: 0;
 }
-#export {
-  grid-area: download;
-}
 #frame-label {
-  grid-area: caption;
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 #timeline {
-  grid-area: slider;
   width: 100%;
   margin: 0;
   padding: 0;
-}
-@media (max-width: 970px) {
-  .views {
-    grid-template-columns: 1fr;
-  }
-}
-@media (max-width: 600px) {
-  .workspace {
-    grid-template-columns: 1fr;
-  }
-}
-.perspective {
-  grid-column: 1 / -1;
 }
 .perspective figcaption {
   display: flex;
@@ -264,8 +264,83 @@ fieldset {
 .page-heading .primary {
   width: auto;
 }
-.history-heading {
-  margin-top: 8px;
+#home .page-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+}
+.home-intro > p {
+  margin: 0 0 12px;
+  max-width: 72ch;
+  font-size: 1.06rem;
+}
+.home-intro h2,
+.history h2 {
+  margin-bottom: 10px;
+  font-size: 1.25rem;
+}
+.home-intro h2 {
+  margin-top: 26px;
+}
+.puzzle-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.puzzle-list > li {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 4px 16px;
+  align-items: baseline;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.puzzle-list p {
+  margin: 0;
+}
+.steps {
+  margin: 8px 0 0;
+  padding-inline-start: 1.35em;
+  line-height: 1.45;
+}
+.steps li + li {
+  margin-top: 4px;
+}
+.history {
+  border-top: 1px solid var(--line);
+  margin-top: 22px;
+  padding-top: 22px;
+}
+.history > p {
+  margin: 0 0 12px;
+  color: var(--dim);
+}
+.run-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.run-brief {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 16px 28px;
+  padding: 16px 20px;
+}
+.run-brief h2 {
+  margin-bottom: 6px;
+}
+.run-brief .hint {
+  margin-top: 10px;
+}
+.section-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 12px;
+  font-size: 0.9rem;
+  color: var(--accent);
 }
 .run-list {
   display: grid;
@@ -314,19 +389,8 @@ fieldset {
   font-size: 1.15rem;
   color: var(--accent);
 }
-.back-link,
-.button-link {
-  color: var(--text);
-}
-.button-link {
-  display: inline-block;
-  margin-top: 10px;
-}
-.button-link[hidden],
-label[hidden] {
-  display: none;
-}
-#setup {
+#setup,
+#drawing-dialog {
   max-width: min(460px, calc(100vw - 24px));
   width: 100%;
   padding: 20px;
@@ -335,7 +399,8 @@ label[hidden] {
   border: 1px solid var(--line);
   border-radius: 11px;
 }
-#setup::backdrop {
+#setup::backdrop,
+#drawing-dialog::backdrop {
   background: #080f11b0;
 }
 .setup-heading {
@@ -347,40 +412,36 @@ label[hidden] {
 .setup-heading h2 {
   margin: 0;
 }
-#layout label:first-child,
+#layout .puzzle-field,
+#setup-description,
 #layout button.primary {
   grid-column: 1 / -1;
 }
-#manual-panel {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  padding: 15px;
-  border-radius: 9px;
+#setup-description {
+  margin: -4px 0 4px;
 }
-#manual-panel summary {
-  cursor: pointer;
+#manual-panel > summary {
   font-weight: 650;
+}
+#manual-panel p,
+#connection {
+  margin-top: 8px;
 }
 #manual-panel .toggle {
   margin-bottom: 10px;
 }
+#move {
+  max-width: 760px;
+}
+#move .primary {
+  width: auto;
+}
+#guard-settings {
+  max-width: 320px;
+}
 #agent-panel button {
   margin-top: 8px;
 }
-#play-replay {
-  grid-area: play;
-}
-@media (max-width: 490px) {
-  .replay {
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "heading heading"
-      "caption caption"
-      "slider slider"
-      "play download";
-  }
-}
-
 #agent-prompt {
   width: 100%;
   resize: vertical;
@@ -391,19 +452,21 @@ label[hidden] {
   margin-top: 10px;
   font-size: 0.86rem;
 }
-#endpoint-setup summary {
-  cursor: pointer;
-}
-
 #help-panel {
-  border: 1px solid var(--accent);
-  border-radius: 8px;
-  padding: 14px;
+  border-color: var(--accent);
+  margin-bottom: 16px;
+}
+#help-panel label {
+  margin-top: 10px;
+}
+#help-dispatch {
+  width: auto;
 }
 #help-panel textarea {
   width: 100%;
 }
 .table-wrap {
+  margin-top: 8px;
   overflow-x: auto;
 }
 #shift-table {
@@ -432,6 +495,9 @@ label[hidden] {
 #shift-table .good {
   color: #9fd8a8;
 }
+#routine-panel {
+  margin-top: 10px;
+}
 #routine-panel pre {
   max-height: 260px;
   overflow: auto;
@@ -439,9 +505,61 @@ label[hidden] {
   white-space: pre-wrap;
 }
 
-#work-instruction-image {
+.run-followup {
+  margin-top: 16px;
+}
+.worksheet-content {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 4fr);
+  align-items: start;
+  gap: 16px 22px;
+}
+.worksheet-image {
+  display: block;
   width: 100%;
   height: auto;
   border-radius: 6px;
-  margin-bottom: 10px;
+}
+#enlarge-drawing {
+  display: block;
+  width: 100%;
+  padding: 0;
+  cursor: zoom-in;
+}
+#enlarge-drawing:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+#worksheet-help {
+  margin-top: 10px;
+}
+#drawing-dialog {
+  max-width: min(1040px, calc(100vw - 24px));
+}
+.drawing-viewport {
+  margin-top: 14px;
+  overflow: auto;
+  max-height: calc(85dvh - 80px);
+}
+.drawing-viewport img {
+  min-width: 760px;
+}
+@media (min-width: 900px) {
+  .run-overview:has(#agent-panel:not([hidden])) {
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  }
+}
+@media (max-width: 760px) {
+  .run-brief,
+  .worksheet-content {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 490px) {
+  .puzzle-list > li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+[hidden] {
+  display: none;
 }

@@ -12,18 +12,28 @@
     <main>
       <section id="home" hidden>
         <header class="page-heading">
-          <div><h1>Robot Arm Playground</h1><p>Review runs and watch how each attempt played out.</p></div>
+          <h1>Robot Arm Playground</h1>
           <button class="primary" id="new-run" type="button">New run</button>
         </header>
-        <h2 class="history-heading">Past runs</h2>
-        <p id="history-message" role="status">Loading runs…</p>
-        <div id="run-list" class="run-list"></div>
+        <div class="home-intro">
+          <p>Robot Arm Playground tests how AI models handle real robotics jobs in a browser simulator. You can connect a model over MCP (Model Context Protocol) and have it drive the arm using camera views and readings from its wrist and gripper, much like it would at a real workbench.</p>
+          <p>The puzzles start with fitting a peg in a hole and build up to running a small factory station. As the jobs get harder, the model has to recover when things move, check parts for defects, and adapt when a new batch comes with different instructions.</p>
+          <h2>Puzzles</h2>
+          <ul id="puzzle-list" class="puzzle-list"></ul>
+        </div>
+        <section class="history" aria-labelledby="history-heading">
+          <h2 id="history-heading">Past runs</h2>
+          <p>Review past runs and watch how each attempt played out.</p>
+          <p class="hint" id="history-message" role="status">Loading runs…</p>
+          <div id="run-list" class="run-list"></div>
+        </section>
       </section>
 
       <dialog id="setup" aria-labelledby="setup-title">
         <div class="setup-heading"><h2 id="setup-title">New run</h2><button id="cancel-setup" type="button">Cancel</button></div>
         <form id="layout">
-          <label>Puzzle <select id="task"><option value="peg">Peg insertion</option><option value="block">Block transfer</option><option value="keyed">Keyed socket</option><option value="machine">Machine loading</option><option value="cell">Work cell shift</option></select></label>
+          <label class="puzzle-field">Puzzle <select id="task" aria-describedby="setup-description"></select></label>
+          <p class="hint" id="setup-description"></p>
           <label>Seed <input id="seed" type="number" min="1" max="999999" value="1" required></label>
           <label><span id="angle-label">Fixture angle</span> <input id="angle" type="number" min="-180" max="180" value="26" required></label>
           <label>Agent images <select id="cadence"><option value="1">Every move</option><option value="3">Every 3 moves</option></select></label>
@@ -36,109 +46,146 @@
       </dialog>
 
       <section id="run-page" hidden>
-        <a class="back-link" href="/">← Past runs</a>
+        <a class="back-link" href="/">← Home</a>
         <header class="page-heading">
           <div><h1 id="run-title">Run</h1><p id="run-layout"></p></div>
           <div class="run-counter"><strong id="move-counter">—</strong><span id="run-result"></span></div>
         </header>
 
-        <div class="workspace">
-          <section class="views" aria-label="Robot and cameras">
-            <figure class="perspective">
-              <figcaption>
-                <strong>3D workspace</strong>
-                <span>Drag to orbit · Scroll or pinch to zoom</span>
-                <button id="reset-view" type="button">Reset camera</button>
-              </figcaption>
-              <canvas id="perspective" width="760" height="520" aria-label="Interactive 3D view of the robot arm"></canvas>
-            </figure>
-            <section class="replay">
-              <h2>Replay</h2>
-              <label for="timeline" id="frame-label">Starting frame</label>
-              <input id="timeline" type="range" min="0" max="0" value="0" disabled>
-              <button type="button" id="play-replay" disabled>Play replay</button>
-              <button type="button" id="export" disabled>Download replay</button>
+        <div class="run-overview" id="run-overview" hidden>
+          <section class="run-brief panel" aria-labelledby="goal-heading">
+            <div>
+              <h2 id="goal-heading">What is this supposed to do?</h2>
+              <p id="goal"></p>
+              <ol class="steps" id="goal-steps" hidden></ol>
+              <p class="hint">The model gets a detailed assignment through MCP, including how to control the arm.</p>
+            </div>
+            <div>
+              <h2>What success looks like</h2>
+              <p id="success-criteria"></p>
+              <div class="section-links" id="shift-links" hidden>
+                <a href="#worksheet">Work cell worksheet</a>
+                <a href="#shift-panel">Shift results</a>
+              </div>
+            </div>
+          </section>
+          <section class="panel" id="agent-panel" hidden aria-labelledby="agent-heading">
+            <h2 id="agent-heading">Agent connection</h2>
+            <div id="agent-prompt-group" hidden>
+              <label>Prompt for your AI agent <textarea id="agent-prompt" rows="4" readonly></textarea></label>
+              <button type="button" id="copy-prompt">Copy prompt</button>
+            </div>
+            <details id="endpoint-setup" hidden>
+              <summary>MCP setup</summary>
+              <label>MCP URL <input id="endpoint" type="text" readonly></label>
+            </details>
+            <button type="button" id="connect" hidden>Retry connection</button>
+            <p class="hint" id="connection" role="status"></p>
+          </section>
+        </div>
+        <section class="panel" id="help-panel" hidden aria-live="polite">
+          <h2>Help requested</h2>
+          <p id="help-request"></p>
+          <label>Reply <textarea id="help-reply" rows="2" placeholder="Optional message to the agent"></textarea></label>
+          <div class="actions">
+            <button type="button" class="primary" id="help-dispatch">Send technician</button>
+            <button type="button" id="help-send">Send reply</button>
+            <button type="button" id="help-decline">Decline</button>
+          </div>
+        </section>
+        <section class="views" aria-label="Run workspace">
+          <section class="panel replay" id="replay" aria-labelledby="replay-heading">
+            <div class="replay-header">
+              <h2 id="replay-heading">Replay</h2>
+              <div class="replay-actions">
+                <button type="button" id="play-replay" disabled>Play replay</button>
+                <button type="button" id="export" disabled>Download replay</button>
+              </div>
+            </div>
+            <label for="timeline" id="frame-label">Starting frame</label>
+            <input id="timeline" type="range" min="0" max="0" value="0" disabled>
+            <p class="hint" id="status" role="status"></p>
+            <p class="hint" id="save-warning" hidden role="status"></p>
+          </section>
+          <figure class="perspective">
+            <figcaption>
+              <strong>3D workspace</strong>
+              <span>Drag to orbit · Scroll or pinch to zoom</span>
+              <button id="reset-view" type="button">Reset camera</button>
+            </figcaption>
+            <canvas id="perspective" width="760" height="520" aria-label="Interactive 3D view of the robot arm"></canvas>
+          </figure>
+          <details class="panel" id="manual-panel" hidden>
+            <summary>Manual controls</summary>
+            <p class="hint">With manual control on, click the overhead image to set X and Y, then select Move arm. Raise Z before moving across the table.</p>
+            <label class="toggle"><input id="manual-mode" type="checkbox"> Take manual control</label>
+            <form id="move">
+              <fieldset id="controls" disabled>
+                <div class="inputs">
+                  <label>X · mm <input id="x" type="number" step="0.1" min="-220" max="220" value="0" required></label>
+                  <label>Y · mm <input id="y" type="number" step="0.1" min="-160" max="160" value="-90" required></label>
+                  <label>Z · mm <input id="z" type="number" step="0.1" min="18" max="220" value="155" required></label>
+                  <label>Yaw · ° <input id="yaw" type="number" min="-180" max="180" value="0" required></label>
+                  <label>Pitch · ° <input id="pitch" type="number" min="-90" max="90" value="0" required></label>
+                  <label>Roll · ° <input id="roll" type="number" min="-90" max="90" value="0" required></label>
+                </div>
+                <label class="toggle"><input id="guard" type="checkbox"> Stop on force</label>
+                <div class="inputs" id="guard-settings" hidden>
+                  <label>Threshold · N <input id="guard-force" disabled type="number" min="0.2" max="25" step="0.1" value="1"></label>
+                  <label>Speed · mm/s <input id="guard-speed" disabled type="number" min="5" max="120" value="35"></label>
+                </div>
+                <div class="actions">
+                  <button type="submit" class="primary">Move arm</button>
+                  <button type="button" id="close">Close jaws</button>
+                  <button type="button" id="open">Open jaws</button>
+                  <button type="button" id="finish">Finish</button>
+                </div>
+              </fieldset>
+            </form>
+          </details>
+          <div class="observations">
+            <section class="panel" id="frame-readings" hidden aria-labelledby="readings-heading">
+              <h2 id="readings-heading">Robot readings</h2>
+              <pre id="readings"></pre>
+              <details id="joint-panel" hidden><summary>Joint angles and limits</summary><pre id="joint-readings"></pre></details>
             </section>
             <figure><figcaption>Overhead</figcaption><img id="overhead" width="760" height="520" alt="Overhead camera frame"></figure>
             <figure><figcaption>Side</figcaption><img id="side" width="760" height="520" alt="Side camera frame"></figure>
             <figure id="inspection-view" hidden><figcaption>Slot inspection</figcaption><img id="inspection" width="760" height="520" alt="Close-up of the machine slot from the front"></figure>
-          </section>
+          </div>
+        </section>
 
-          <aside>
-            <section id="agent-panel" hidden>
-              <h2>Agent connection</h2>
-              <div id="agent-prompt-group" hidden>
-                <label>Prompt for Claude <textarea id="agent-prompt" rows="4" readonly></textarea></label>
-                <button type="button" id="copy-prompt">Copy prompt</button>
-              </div>
-              <details id="endpoint-setup" hidden>
-                <summary>MCP setup</summary>
-                <label>MCP URL <input id="endpoint" type="text" readonly></label>
-              </details>
-              <button type="button" id="connect" hidden>Retry connection</button>
-              <p class="hint" id="connection" role="status"></p>
-            </section>
-            <section id="help-panel" hidden aria-live="polite">
-              <h2>Help requested</h2>
-              <p id="help-request"></p>
-              <label>Reply <textarea id="help-reply" rows="2" placeholder="Optional message to the agent"></textarea></label>
-              <div class="actions">
-                <button type="button" class="primary" id="help-dispatch">Send technician</button>
-                <button type="button" id="help-send">Send reply</button>
-                <button type="button" id="help-decline">Decline</button>
-              </div>
-            </section>
-            <section id="shift-panel" hidden>
-              <h2>Shift</h2>
-              <p class="hint" id="shift-summary"></p>
-              <div class="table-wrap"><table id="shift-table"><thead><tr><th>#</th><th>Rev</th><th>Condition</th><th>Outcome</th><th>Moves</th><th>Time</th></tr></thead><tbody></tbody></table></div>
-              <details id="routine-panel" hidden><summary>Routine · <span id="routine-status">idle</span></summary><pre id="routine-log"></pre><pre id="routine-code"></pre></details>
-            </section>
-            <section>
-              <h2>Objective</h2>
-              <p class="hint" id="goal"></p>
-              <img id="work-instruction-image" width="760" height="520" alt="Work instruction drawing for the current revision" hidden>
-              <button type="button" id="share">Copy layout link</button>
-              <a class="button-link" id="repeat-run" href="/" hidden>Run this layout again</a>
-            </section>
-            <section aria-label="Frame telemetry">
-              <h2 id="frame-heading">Current frame</h2>
-              <p class="hint" id="status" role="status"></p><p class="hint" id="save-warning" hidden role="status"></p>
-              <pre id="readings"></pre>
-              <details id="joint-panel" hidden><summary>Joint angles and limits</summary><pre id="joint-readings"></pre></details>
-            </section>
-            <details id="manual-panel" hidden>
-              <summary>Manual controls</summary>
-              <p class="hint">Click overhead to set X/Y. Raise Z before crossing the field.</p>
-              <label class="toggle"><input id="manual-mode" type="checkbox"> Take manual control</label>
-              <form id="move">
-                <fieldset id="controls" disabled>
-                  <div class="inputs">
-                    <label>X · mm <input id="x" type="number" step="0.1" min="-220" max="220" value="0" required></label>
-                    <label>Y · mm <input id="y" type="number" step="0.1" min="-160" max="160" value="-90" required></label>
-                    <label>Z · mm <input id="z" type="number" step="0.1" min="18" max="220" value="155" required></label>
-                    <label>Yaw · ° <input id="yaw" type="number" min="-180" max="180" value="0" required></label>
-                    <label>Pitch · ° <input id="pitch" type="number" min="-90" max="90" value="0" required></label>
-                    <label>Roll · ° <input id="roll" type="number" min="-90" max="90" value="0" required></label>
-                  </div>
-                  <label class="toggle"><input id="guard" type="checkbox"> Stop on force</label>
-                  <div class="inputs" id="guard-settings" hidden>
-                    <label>Threshold · N <input id="guard-force" disabled type="number" min="0.2" max="25" step="0.1" value="1"></label>
-                    <label>Speed · mm/s <input id="guard-speed" disabled type="number" min="5" max="120" value="35"></label>
-                  </div>
-                  <button type="submit" class="primary">Move arm</button>
-                  <div class="actions">
-                    <button type="button" id="close">Close jaws</button>
-                    <button type="button" id="open">Open jaws</button>
-                    <button type="button" id="finish">Finish</button>
-                  </div>
-                </fieldset>
-              </form>
-            </details>
-          </aside>
-        </div>
-
+        <section class="panel run-followup" id="worksheet" hidden aria-labelledby="worksheet-heading">
+          <h2 id="worksheet-heading">Work cell worksheet</h2>
+          <div class="worksheet-content">
+            <button type="button" id="enlarge-drawing" aria-label="Enlarge part drawing" aria-haspopup="dialog" aria-controls="drawing-dialog">
+              <img id="work-instruction-image" class="worksheet-image" width="760" height="520" alt="Drawing of the part with its measurements and correct F marking">
+            </button>
+            <div>
+              <p id="worksheet-part"></p>
+              <ol class="steps" id="worksheet-steps"></ol>
+              <p id="worksheet-help"></p>
+            </div>
+          </div>
+        </section>
+        <section class="panel run-followup" id="shift-panel" hidden aria-labelledby="shift-heading">
+          <h2 id="shift-heading">Shift results</h2>
+          <p class="hint" id="shift-summary"></p>
+          <div class="table-wrap"><table id="shift-table"><thead><tr><th scope="col">Cycle</th><th scope="col">Revision</th><th scope="col">Condition</th><th scope="col">Outcome</th><th scope="col">Moves</th><th scope="col">Time</th></tr></thead><tbody></tbody></table></div>
+          <details id="routine-panel" hidden><summary>Routine · <span id="routine-status">idle</span></summary><pre id="routine-log"></pre><pre id="routine-code"></pre></details>
+        </section>
       </section>
+
+      <dialog id="drawing-dialog" aria-labelledby="drawing-heading">
+        <div class="setup-heading">
+          <h2 id="drawing-heading">Part drawing</h2>
+          <form method="dialog"><button type="submit" autofocus>Close</button></form>
+        </div>
+        <!-- biome-ignore lint/a11y/noNoninteractiveTabindex: The scrollable drawing needs keyboard access. -->
+        <section class="drawing-viewport" tabindex="0" aria-label="Full-size drawing">
+          <img class="worksheet-image" id="large-drawing" width="760" height="520" alt="Drawing of the part with its measurements and correct F marking">
+        </section>
+      </dialog>
     </main>
   </body>
 </html>

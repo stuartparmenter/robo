@@ -31,6 +31,7 @@ import {
   loadPhysics,
   Simulation,
 } from "./physics";
+import { puzzle } from "./puzzles";
 import { type CycleOutcome, RoutineSandbox } from "./routine";
 import { type FieldPose, FieldView, fieldPose, overheadHalfExtent } from "./view";
 
@@ -38,6 +39,16 @@ function element<T extends HTMLElement>(id: string) {
   const node = document.getElementById(id);
   if (!node) throw new Error(`Missing element ${id}`);
   return node as T;
+}
+
+function renderSteps(list: HTMLElement, steps: string[]) {
+  list.replaceChildren(
+    ...steps.map((step) => {
+      const item = document.createElement("li");
+      item.textContent = step;
+      return item;
+    }),
+  );
 }
 
 const task = element<HTMLSelectElement>("task");
@@ -66,38 +77,6 @@ const cameras = {
   inspection: element<HTMLImageElement>("inspection"),
 };
 
-const puzzle = {
-  peg: {
-    title: "Peg insertion",
-    goal: "Pick up the peg, align it with the socket, and release it once seated.",
-    criteria:
-      "Peg seated at the socket floor, approximately aligned, released and stationary for 250 simulated milliseconds.",
-  },
-  block: {
-    title: "Block transfer",
-    goal: "Pick up the block and release it upright in the center of the marked pad.",
-    criteria: "Block centered on the pad, upright, released and stationary for 250 simulated milliseconds.",
-  },
-  keyed: {
-    title: "Keyed socket",
-    goal: "Match the peg’s marked corner to the socket notch. The socket can slide when pushed. Check its position again after contact.",
-    criteria:
-      "Keyed peg seated at the socket floor with the tab in the matching notch, released and stationary for 250 simulated milliseconds.",
-  },
-  cell: {
-    title: "Work cell shift",
-    goal: "Run a shift in this single-arm work cell. Each cycle a part arrives in the infeed nest. Follow the current work instruction: check the part, put nonconforming parts in the red reject bin, or load conforming parts into the machine and close it. Call finish to end each cycle. The work instruction can change during the shift.",
-    criteria:
-      "Score per cycle: a conforming part loaded and run correctly, or a nonconforming part rejected in the bin with the right reject_reason, +1 (a bin reject with a missing or wrong reason +0.5). A nonconforming part run in the machine (escape) −3. A conforming part run with the stop off its marks, off centre, or with debris in the slot (scrap) −1. A false reject or unfinished cycle 0. Each protective stop −0.5. Each technician visit −0.5, except one that clears a machine fault you cannot clear yourself. Shift score = total ÷ cycles. Time and model calls are reported, not scored. The machine reports only what its own sensors can see.",
-  },
-  machine: {
-    title: "Machine loading",
-    goal: "Press the red latch until it stays down on its own. Grip the handle and slide the cover along X toward the exposed gold rails. Stand the orange part on edge across both supports of the blue cradle, release and regrasp it, then load the machine and close the cover. Closing it lets the latch spring back up and lock. Leave it up.",
-    criteria:
-      "The part was released on edge in the blue cradle, then loaded on edge in the machine. Finish with the part released, cover closed, and latch engaged.",
-  },
-} satisfies Record<Layout["task"], { title: string; goal: string; criteria: string }>;
-
 function taskFromValue(value: string | null): Layout["task"] {
   return value && Object.hasOwn(puzzle, value) ? (value as Layout["task"]) : defaultLayout.task;
 }
@@ -121,6 +100,9 @@ function layoutFromInputs(): Layout {
 }
 
 const initial = new URL(location.href).searchParams;
+for (const [value, { title }] of Object.entries(puzzle)) {
+  task.add(new Option(title, value));
+}
 task.value = taskFromValue(initial.get("task"));
 const bounded = (name: string, fallback: number, min: number, max: number) => {
   const value = Number(initial.get(name) ?? fallback);
@@ -133,8 +115,10 @@ shift.checked = !isLoading(task.value) && initial.get("shift") === "1";
 cyclesInput.value = String(bounded("cycles", defaultCycles, 4, 12));
 attended.checked = initial.get("attended") === "1";
 function updateLayoutOptions() {
-  const cell = task.value === "cell";
-  shift.disabled = isLoading(task.value);
+  const selected = taskFromValue(task.value);
+  const cell = selected === "cell";
+  element("setup-description").textContent = puzzle[selected].description;
+  shift.disabled = isLoading(selected);
   element("shift-field").hidden = cell;
   element("cycles-field").hidden = !cell;
   element("attended-field").hidden = !cell;
@@ -224,6 +208,27 @@ async function showHome() {
   }
 }
 
+function renderPuzzleList() {
+  const list = element("puzzle-list");
+  for (const { title, description, steps } of Object.values(puzzle)) {
+    const item = document.createElement("li");
+    const heading = document.createElement("h3");
+    heading.textContent = title;
+    const body = document.createElement("div");
+    const intro = document.createElement("p");
+    intro.textContent = description;
+    body.append(intro);
+    if (steps) {
+      const stepList = document.createElement("ol");
+      stepList.className = "steps";
+      renderSteps(stepList, steps);
+      body.append(stepList);
+    }
+    item.append(heading, body);
+    list.append(item);
+  }
+}
+
 element<HTMLButtonElement>("new-run").onclick = () => setup.showModal();
 element<HTMLButtonElement>("cancel-setup").onclick = () => setup.close();
 element<HTMLFormElement>("layout").onsubmit = (event) => {
@@ -241,16 +246,28 @@ async function start(id: string) {
   const archived = Boolean(saved);
   if (!saved && !initial.has("task")) throw new Error("This replay is not available in this browser.");
   const layout = saved?.summary.layout ?? layoutFromInputs();
-  element("run-title").textContent = puzzle[layout.task].title;
+  const cell = layout.task === "cell";
+  const { title, description, steps, success } = puzzle[layout.task];
+  element("run-title").textContent = title;
   element("run-layout").textContent = layoutDescription(layout);
-  element("goal").textContent = puzzle[layout.task].goal;
-  element("shift-panel").hidden = layout.task !== "cell";
+  element("goal").textContent = description;
+  element("success-criteria").textContent = success;
+  if (steps) {
+    const list = element("goal-steps");
+    renderSteps(list, steps);
+    list.hidden = false;
+  }
+  element("run-overview").hidden = false;
   status.textContent = archived ? "Loading replay…" : "Loading simulator…";
   page.hidden = false;
   const mj = await physics;
   const sim = new Simulation(mj, layout);
   const view = new FieldView(sim, element<HTMLCanvasElement>("perspective"));
-  const cell = layout.task === "cell";
+  element("frame-readings").hidden = false;
+  element("shift-panel").hidden = !cell;
+  element("shift-links").hidden = !cell;
+  const drawingDialog = element<HTMLDialogElement>("drawing-dialog");
+  element<HTMLButtonElement>("enlarge-drawing").onclick = () => drawingDialog.showModal();
   /** The cycle whose part shape the 3D view currently shows. */
   let shownCycle = sim.cycleIndex;
   const sandbox = new RoutineSandbox();
@@ -370,8 +387,6 @@ async function start(id: string) {
       sim.showCycle(frame.cycle);
       view.refreshShapes(sim);
     }
-    element("frame-heading").textContent =
-      archived || index < frames.length - 1 ? "Replay frame" : "Current frame";
     if (!animation) view.drawPerspective(perspective);
     const {
       x_mm,
@@ -393,6 +408,7 @@ async function start(id: string) {
       shift: shiftReading,
       machine: machineSignals,
     } = frame.readings;
+    showInstruction(shiftReading?.work_instruction_revision);
     for (const camera of ["overhead", "side"] as const) cameras[camera].src = frame.images[camera];
     element("inspection-view").hidden = !frame.images.inspection;
     if (frame.images.inspection) cameras.inspection.src = frame.images.inspection;
@@ -413,12 +429,13 @@ async function start(id: string) {
     if (machineSignals) lines.push(`Door  ${machineSignals.door_locked ? "locked" : "unlocked"}`);
     if (wrist_force_n && wrist_torque_nm && gripper && controller) {
       const xyz = ({ x, y, z }: { x: number; y: number; z: number }) => `${x}, ${y}, ${z}`;
-      lines.push(
-        `Force XYZ  ${xyz(wrist_force_n)} N`,
-        `Torque XYZ  ${xyz(wrist_torque_nm)} N·m`,
-        `Grip effort  ${gripper.effort_n} N · object ${gripper.object_detected ? "detected" : "–"}`,
-        `Controller  ${controller.stop_reason.replaceAll("_", " ")}`,
-      );
+      lines.push(`Force XYZ  ${xyz(wrist_force_n)} N`, `Torque XYZ  ${xyz(wrist_torque_nm)} N·m`);
+      if (typeof gripper.effort_n === "number") {
+        lines.push(
+          `Grip effort  ${gripper.effort_n} N · object ${gripper.object_detected ? "detected" : "–"}`,
+        );
+      }
+      lines.push(`Controller  ${controller.stop_reason.replaceAll("_", " ")}`);
       if (controller.guard) lines.push(`Guard peak  ${controller.guard.peak_n} N`);
     }
     element("joint-panel").hidden = !controller;
@@ -452,11 +469,15 @@ async function start(id: string) {
     }
     element("readings").textContent = lines.join("\n");
     status.textContent = ended
-      ? success
-        ? "Success. The piece stayed in place after release."
-        : checks
-          ? "Attempt ended. See the checks below."
-          : "Attempt ended. The piece did not pass the placement check."
+      ? cell
+        ? "Shift complete. See Shift results for the outcome of each cycle."
+        : success
+          ? checks
+            ? "All loading checks passed."
+            : "Success. The piece stayed in place after release."
+          : checks
+            ? "Attempt ended. See the checks under Robot readings."
+            : "Attempt ended. The piece did not pass the placement check."
       : stopped_short
         ? "The arm stopped short of the requested target."
         : index < frames.length - 1
@@ -591,15 +612,21 @@ async function start(id: string) {
 
   let shownRevision: string | undefined;
   function showInstruction(revision: string | undefined) {
-    if (!cell || !revision || revision === shownRevision) return;
+    if ((revision !== "A" && revision !== "B") || revision === shownRevision) return;
+    const instruction = workInstruction(revision);
+    const drawing = drawWorkInstruction(revision, 2);
+    element("worksheet-heading").textContent = `Work cell worksheet · Revision ${revision}`;
+    element("drawing-heading").textContent = `Part drawing · Revision ${revision}`;
+    element<HTMLImageElement>("work-instruction-image").src = drawing;
+    element<HTMLImageElement>("large-drawing").src = drawing;
+    element("worksheet-part").textContent = instruction.part;
+    renderSteps(element("worksheet-steps"), instruction.steps);
+    element("worksheet-help").textContent = instruction.disposition;
+    element("worksheet").hidden = false;
     shownRevision = revision;
-    const drawing = element<HTMLImageElement>("work-instruction-image");
-    drawing.src = drawWorkInstruction(revision as "A" | "B");
-    drawing.hidden = false;
   }
 
   function record(label: string, samples?: FieldPose[]) {
-    showInstruction(sim.cycleSpec?.revision);
     if (cell && sim.cycleIndex !== shownCycle) {
       shownCycle = sim.cycleIndex;
       view.refreshShapes(sim);
@@ -1184,14 +1211,6 @@ async function start(id: string) {
     if (sessionActive) connection.textContent = sessionStatus();
   };
 
-  element<HTMLButtonElement>("share").onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(layoutUrl(sim.layout).href);
-      status.textContent = "Layout link copied.";
-    } catch {
-      status.textContent = `Layout link: ${layoutUrl(sim.layout).href}`;
-    }
-  };
   endpoint.onclick = () => endpoint.select();
   guarded.onchange = () => {
     element("guard-settings").hidden = !guarded.checked;
@@ -1285,14 +1304,10 @@ async function start(id: string) {
     if (!frames.length) throw new Error("This replay has no saved frames.");
     syncTimeline();
     timeline.value = timeline.max;
-    const repeat = element<HTMLAnchorElement>("repeat-run");
-    repeat.href = layoutUrl(layout).href;
-    repeat.hidden = false;
     showFrame(frames.length - 1);
     updateProgress();
     renderShift();
     renderRoutine();
-    showInstruction(frames[frames.length - 1].frame.readings.shift?.work_instruction_revision);
   } else {
     addEventListener("pagehide", () => {
       const previous = socket;
@@ -1312,8 +1327,8 @@ async function start(id: string) {
     void firstFrame.saved.then(() => {
       if (element("save-warning").hidden) history.replaceState(null, "", runUrl(id));
     });
-    element("manual-panel").hidden = false;
     element("agent-panel").hidden = false;
+    element("manual-panel").hidden = false;
     void connectAgent();
   }
 }
@@ -1324,6 +1339,7 @@ if (runId) {
     status.textContent = errorMessage(error, "The run could not be opened.");
   });
 } else {
+  renderPuzzleList();
   void showHome();
   if (initial.has("task")) setup.showModal();
   addEventListener("pageshow", (event) => {
