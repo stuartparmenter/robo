@@ -33,7 +33,7 @@ import {
 } from "./physics";
 import { puzzle } from "./puzzles";
 import { type CycleOutcome, RoutineSandbox } from "./routine";
-import { type FieldPose, FieldView, fieldPose, overheadHalfExtent } from "./view";
+import { type FieldPose, FieldView, fieldPose, GraphicsUnavailableError, overheadHalfExtent } from "./view";
 
 function element<T extends HTMLElement>(id: string) {
   const node = document.getElementById(id);
@@ -83,6 +83,30 @@ function taskFromValue(value: string | null): Layout["task"] {
 
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error ? error.message : fallback;
+
+/** Replace the empty workspace with an explanation when a run cannot open. */
+function showRunError(error: unknown) {
+  element("views").hidden = true;
+  element("run-error-message").textContent = errorMessage(
+    error,
+    "Something went wrong while loading the run.",
+  );
+  if (error instanceof GraphicsUnavailableError) {
+    element("run-error-heading").textContent = "This browser can’t show the simulator";
+    element("run-error-message").textContent =
+      "The simulator needs WebGPU or WebGL 2 to draw the arm and the camera images, and neither could start in this browser.";
+    const tips = element("run-error-tips");
+    renderSteps(tips, [
+      "Turn on hardware acceleration in your browser’s settings, then reload this page.",
+      "Update your browser, or try a current version of Chrome, Edge, Firefox or Safari.",
+      "If this browser is running inside WSL, a virtual machine or a remote desktop, open the page in a browser on the host computer instead.",
+    ]);
+    tips.hidden = false;
+    element("run-error-detail").textContent = error.message;
+    element("run-error-details").hidden = false;
+  }
+  element("run-error").hidden = false;
+}
 
 const isLoading = (value: string) => value === "machine" || value === "cell";
 
@@ -262,7 +286,7 @@ async function start(id: string) {
   page.hidden = false;
   const mj = await physics;
   const sim = new Simulation(mj, layout);
-  const view = new FieldView(sim, element<HTMLCanvasElement>("perspective"));
+  const view = await FieldView.create(sim, element<HTMLCanvasElement>("perspective"));
   element("frame-readings").hidden = false;
   element("shift-panel").hidden = !cell;
   element("shift-links").hidden = !cell;
@@ -1336,7 +1360,7 @@ async function start(id: string) {
 if (runId) {
   start(runId).catch((error) => {
     page.hidden = false;
-    status.textContent = errorMessage(error, "The run could not be opened.");
+    showRunError(error);
   });
 } else {
   renderPuzzleList();

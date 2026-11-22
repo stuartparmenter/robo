@@ -1,5 +1,5 @@
-import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import * as THREE from "three/webgpu";
 import type { Camera } from "../src/protocol";
 import { machine } from "./machine";
 import type { Simulation } from "./physics";
@@ -42,9 +42,33 @@ function geometry(type: number, a: number, b: number, c: number) {
   }
 }
 
+/** The browser could start neither a WebGPU nor a WebGL 2 renderer. Its message says what was checked. */
+export class GraphicsUnavailableError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = "GraphicsUnavailableError";
+  }
+}
+
+/** Describe which graphics APIs this browser offers, in terms a person can act on. */
+async function graphicsReport() {
+  const { gpu } = navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } };
+  const adapter = gpu ? await gpu.requestAdapter().catch(() => null) : null;
+  const webgpu = !gpu
+    ? "not supported by this browser, or turned off"
+    : adapter
+      ? "available, but the renderer failed to start on it"
+      : "supported, but no compatible graphics adapter was found";
+  const webgl2 = document.createElement("canvas").getContext("webgl2")
+    ? "available, but the renderer failed to start on it"
+    : "a WebGL 2 context could not be created";
+  return `WebGPU: ${webgpu}.\nWebGL 2: ${webgl2}.`;
+}
+
 export class FieldView {
   private readonly scene = new THREE.Scene();
-  private readonly renderer = new THREE.WebGLRenderer({ antialias: true });
+  // Uses WebGPU where the browser supports it and falls back to WebGL 2 otherwise.
+  private readonly renderer = new THREE.WebGPURenderer({ antialias: true });
   private readonly cameras: Record<Camera, THREE.OrthographicCamera>;
   private readonly rotation = new THREE.Matrix4();
   private readonly rotation3 = new THREE.Matrix3();
@@ -63,7 +87,19 @@ export class FieldView {
   private readonly previewPen: CanvasRenderingContext2D;
   private previewPose?: FieldPose;
 
-  constructor(sim: Simulation, preview: HTMLCanvasElement) {
+  /** Build the view and wait for the renderer's GPU device before anything is drawn. */
+  static async create(sim: Simulation, preview: HTMLCanvasElement) {
+    const view = new FieldView(sim, preview);
+    try {
+      await view.renderer.init();
+    } catch (error) {
+      console.error("Renderer failed to start:", error);
+      throw new GraphicsUnavailableError(await graphicsReport(), error);
+    }
+    return view;
+  }
+
+  private constructor(sim: Simulation, preview: HTMLCanvasElement) {
     const slot = sim.cellGeometry ?? machine;
     this.cameras = {
       overhead: orthographic(overheadHalfExtent.x, overheadHalfExtent.y, [0, 0, 0.8], [0, 1, 0], [0, 0, 0]),
@@ -233,6 +269,5 @@ export class FieldView {
       }
     });
     this.renderer.dispose();
-    this.renderer.forceContextLoss();
   }
 }

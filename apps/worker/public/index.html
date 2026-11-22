@@ -93,7 +93,16 @@
             <button type="button" id="help-decline">Decline</button>
           </div>
         </section>
-        <section class="views" aria-label="Run workspace">
+        <section class="panel run-error" id="run-error" hidden role="alert" aria-labelledby="run-error-heading">
+          <h2 id="run-error-heading">This run couldn’t be opened</h2>
+          <p id="run-error-message"></p>
+          <ul id="run-error-tips" hidden></ul>
+          <details id="run-error-details" hidden>
+            <summary>Details</summary>
+            <pre id="run-error-detail"></pre>
+          </details>
+        </section>
+        <section class="views" id="views" aria-label="Run workspace">
           <section class="panel replay" id="replay" aria-labelledby="replay-heading">
             <div class="replay-header">
               <h2 id="replay-heading">Replay</h2>

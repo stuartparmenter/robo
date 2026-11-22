@@ -6,6 +6,7 @@
   --text: #f0e8d6;
   --dim: #bbcac5;
   --accent: #eeb76b;
+  --danger: #f0907e;
   font-family: "Instrument Sans", system-ui, sans-serif;
   color: var(--text);
   background: var(--bg);
@@ -124,6 +125,33 @@ figure {
 .views {
   display: grid;
   gap: 12px;
+}
+.run-error {
+  border-color: var(--danger);
+  border-left-width: 4px;
+  padding: 18px 20px;
+  max-width: 72ch;
+}
+.run-error h2 {
+  color: var(--danger);
+}
+.run-error p {
+  line-height: 1.5;
+}
+.run-error ul {
+  margin: 12px 0 0;
+  padding-left: 1.2em;
+  line-height: 1.5;
+}
+.run-error details {
+  margin-top: 14px;
+  color: var(--dim);
+  font-size: 0.85rem;
+}
+.run-error pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .observations {
   display: grid;

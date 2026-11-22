@@ -23,6 +23,15 @@ try {
           build.onResolve({ filter: /^@mujoco\/mujoco$/ }, () => ({ path: "/mujoco.js", external: true }));
         },
       },
+      {
+        // Three.js addons import "three"; point them at the WebGPU build the view uses
+        // so the page bundles one copy of the core classes.
+        name: "three-webgpu",
+        setup(build) {
+          const webgpu = Bun.resolveSync("three/webgpu", worker);
+          build.onResolve({ filter: /^three$/ }, () => ({ path: webgpu }));
+        },
+      },
     ],
   });
   if (!result.success) throw new AggregateError(result.logs, "Browser build failed");
