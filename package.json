@@ -2,7 +2,7 @@
   "name": "robo",
   "private": true,
   "type": "module",
-  "packageManager": "bun@1.4.4",
+  "packageManager": "bun@1.4.5",
   "workspaces": [
     "apps/*"
   ],
@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.8",
-    "@types/bun": "1.4.4",
+    "@types/bun": "1.4.5",
     "typescript": "7.0.2"
   }
 }
