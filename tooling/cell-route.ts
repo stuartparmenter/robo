@@ -113,8 +113,9 @@ export function referenceCycle(sim: Simulation, options: ReferenceOptions = {}) 
     // Turned 90°, the leading finger is a solid plate across the slot.
     goto(loadX, start, 60, 90);
     act(close);
-    act(move(loadX, start, 18, 90));
-    act(move(loadX, loadY - 0.075, 18, 90));
+    // The fingertip runs 2 mm above the bed. Pushed any higher, the chip tips and can wedge under the finger.
+    act(move(loadX, start, 17, 90));
+    act(move(loadX, loadY - 0.075, 17, 90));
   }
 
   pick();

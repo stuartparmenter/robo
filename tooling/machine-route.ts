@@ -42,6 +42,8 @@ export function machineRoute(layout: Layout): Command[] {
     open,
     ...coverMoves(layout, true),
     move(x, y, 150, partYaw),
+    // Fully open, a fingertip can land on the parked cover's corner on the way down to some part poses.
+    { type: "grip", state: "open", width_mm: 50 },
     move(x, y, 18, partYaw),
     close,
     move(x, y, 135, partYaw),

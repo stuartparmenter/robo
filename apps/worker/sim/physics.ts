@@ -104,12 +104,22 @@ const upper = 0.31;
 const forearm = 0.28;
 const toolOffset = 0.065;
 const armJoints = 6;
-const gripperJoints = 2;
-/** Actuated joints come first in qpos, qvel and ctrl; the piece's free joint follows. */
-const motorCount = armJoints + gripperJoints;
-/** Finger travel per jaw in metres. Closing targets lie beyond the inner limit. */
+/** The arm and the two jaws come first in qpos and qvel; the piece's free joint follows. */
+const robotJoints = armJoints + 2;
+/** One drive moves both jaws, so ctrl holds the arm joints, the gripper, then the machine's latch. */
+const gripMotor = armJoints;
+const latchMotor = armJoints + 1;
+/** Finger travel per jaw in metres. */
 const jawTravel = { min: 0.01, max: 0.047 };
-const closedTarget = 0.007;
+/** Jaw travel is measured to each finger's centre; the reported width is between their inner faces. */
+const fingerThickness = 0.008;
+/** Grip force per jaw in newtons, and the drive's gain in newtons per metre of jaw opening. */
+const gripForce = 9;
+const jawGain = 240;
+/** The drive commands the opening, the sum of both jaws' travel. Fully open leaves 1 mm before the outer stops. */
+const openTarget = 2 * (jawTravel.max - 0.001);
+/** Closing commands an opening so far inside the inner stops that the drive is at its force limit at any width. */
+const closedTarget = 2 * jawTravel.min - gripForce / jawGain - 0.006;
 /** Each ramped move or settle advances this many steps after the final target. */
 const settleSteps = 220;
 /** Guarded moves drive in 0.02 s increments and are capped at this much travel time. */
@@ -144,6 +154,11 @@ function seededUnit(seed: number, salt: number) {
   return ((value ^ (value >>> 16)) >>> 0) / 2 ** 32;
 }
 
+/** Calibration error leaves the jaws centred this far off the tool axis, in metres. */
+function jawOffset(layout: Layout) {
+  return layout.calibration ? (seededUnit(layout.seed, 143) - 0.5) * 0.001 : 0;
+}
+
 function positionBias(layout: Layout) {
   return [71, 83, 97].map((salt, index) =>
     layout.calibration ? (seededUnit(layout.seed, salt) - 0.5) * (index === 2 ? 0.0016 : 0.004) : 0,
@@ -168,7 +183,8 @@ function rotation(yaw: number, pitch: number, roll: number) {
   ];
 }
 
-function armTargets([x, y, z, yaw, left, right, pitch, roll]: number[], previous?: Float64Array) {
+/** Joint and gripper commands, in ctrl order, for a target of x, y, z, yaw, jaw opening, pitch and roll. */
+function armTargets([x, y, z, yaw, opening, pitch, roll]: number[], previous?: Float64Array) {
   const m = rotation(yaw, pitch, roll);
   const centerX = x + m[2] * toolOffset;
   const centerY = y + m[5] * toolOffset - baseY;
@@ -186,7 +202,7 @@ function armTargets([x, y, z, yaw, left, right, pitch, roll]: number[], previous
   const wristPitch = Math.atan2(c * m[2] + s * m[5], m[8]) - shoulder - elbow;
   const wristRoll = Math.asin(Math.max(-1, Math.min(1, -side)));
   const toolYaw = Math.atan2(-s * m[0] + c * m[3], -s * m[1] + c * m[4]);
-  const result = [base, shoulder, elbow, wristPitch, wristRoll, toolYaw, left, right];
+  const result = [base, shoulder, elbow, wristPitch, wristRoll, toolYaw, opening];
   let limited = false;
   for (const [index, joint] of jointLimits.entries()) {
     const wraps = "wraps" in joint;
@@ -228,6 +244,8 @@ function scene(layout: Layout, plan?: CycleSpec[]) {
   const peg = layout.task === "peg" || layout.task === "keyed";
   const linkCollision = loading ? 'contype="2" conaffinity="4"' : 'contype="0" conaffinity="0"';
   const keyed = layout.task === "keyed";
+  // The jaws' end stops are hard: the stalled drive must not push a jaw visibly past them.
+  const jawLimits = `range="${jawTravel.min} ${jawTravel.max}" solreflimit=".004 1" solimplimit=".98 .999 .0005"`;
   const walls = [
     box("wall_left", ".008 .030 .014", "-.028 0 .018", ".26 .68 .68 .73"),
     ...(keyed
@@ -242,7 +260,9 @@ function scene(layout: Layout, plan?: CycleSpec[]) {
   ];
   return `<mujoco model="Robo">
     <compiler angle="degree" autolimits="true"/>
-    <option gravity="0 0 -${gravity}" timestep=".002" integrator="implicitfast" cone="elliptic" iterations="45"/>
+    <!-- Soft contacts slip under any tangential load, at a rate that falls in proportion to impratio. At 100 a
+         held part creeps about 0.01 mm/s per newton; near 1000 gripped parts start to chatter. -->
+    <option gravity="0 0 -${gravity}" timestep=".002" integrator="implicitfast" cone="elliptic" impratio="100" solver="Newton" tolerance="1e-10" iterations="45"/>
     <default>
       <geom friction="1.2 .01 .001" solref=".006 1" solimp=".95 .99 .001" condim="4"/>
       <joint damping="4" armature=".01"/>
@@ -273,12 +293,12 @@ function scene(layout: Layout, plan?: CycleSpec[]) {
                   <site name="wrist_sensor" size=".001"/>
                   ${armJoint(5, "0 0 1", ".18")}
                   ${box("wrist", ".046 .015 .008", "0 0 .027", ".70 .79 .86 1", 'mass=".10"')}
-                  <body name="left" gravcomp="1">
-                    <joint name="left_jaw" type="slide" axis="-1 0 0" range=".010 .047"/>
+                  <body name="left" gravcomp="1" pos="${-jawOffset(layout)} 0 0">
+                    <joint name="left_jaw" type="slide" axis="-1 0 0" ${jawLimits}/>
                     ${box("left_finger", ".004 .012 .016", "0 0 .007", ".58 .77 .89 1", 'mass=".025" friction="2 .02 .002"')}
                   </body>
-                  <body name="right" gravcomp="1">
-                    <joint name="right_jaw" type="slide" axis="1 0 0" range=".010 .047"/>
+                  <body name="right" gravcomp="1" pos="${-jawOffset(layout)} 0 0">
+                    <joint name="right_jaw" type="slide" axis="1 0 0" ${jawLimits}/>
                     ${box("right_finger", ".004 .012 .016", "0 0 .007", ".58 .77 .89 1", 'mass=".025" friction="2 .02 .002"')}
                   </body>
                 </body>
@@ -320,16 +340,25 @@ function scene(layout: Layout, plan?: CycleSpec[]) {
       `
       }
     </worldbody>
-    ${
-      // The back stop's clamp is a lock re-anchored wherever the stop is released, so it neither creeps nor drags.
-      // A seized cover slide is a lock too: friction loss alone lets a steady pull creep it open.
-      cell
-        ? `<equality>
-      <joint name="stop_lock" joint1="stop_slide" polycoef="0 0 0 0 0" solref=".004 1"/>
-      <joint name="cover_lock" joint1="cover_slide" polycoef="0 0 0 0 0" solref=".004 1" active="false"/>
-    </equality>`
-        : ""
-    }
+    <tendon>
+      <!-- The gripper's one drive sets the jaw opening, the sum of both jaws' travel. -->
+      <fixed name="jaw_opening">
+        <joint joint="left_jaw" coef="1"/>
+        <joint joint="right_jaw" coef="1"/>
+      </fixed>
+    </tendon>
+    <equality>
+      <!-- Both jaws run off one mechanism, so they stay centred between themselves whatever they touch. -->
+      <joint name="jaw_sync" joint1="left_jaw" joint2="right_jaw" polycoef="0 1 0 0 0" solref=".004 1"/>
+      ${
+        // The back stop's clamp is a lock re-anchored wherever the stop is released, so it neither creeps nor drags.
+        // A seized cover slide is a lock too: friction loss alone lets a steady pull creep it open.
+        cell
+          ? `<joint name="stop_lock" joint1="stop_slide" polycoef="0 0 0 0 0" solref=".004 1"/>
+      <joint name="cover_lock" joint1="cover_slide" polycoef="0 0 0 0 0" solref=".004 1" active="false"/>`
+          : ""
+      }
+    </equality>
     <contact>
       <exclude body1="tool" body2="left"/>
       <exclude body1="tool" body2="right"/>
@@ -341,8 +370,7 @@ function scene(layout: Layout, plan?: CycleSpec[]) {
       <position joint="wrist_pitch" kp="30" kv="1.5" forcerange="-4 4"/>
       <position joint="wrist_roll" kp="30" kv="1.5" forcerange="-4 4"/>
       <position joint="tool_yaw" kp="12" kv=".36" forcerange="-1 1"/>
-      <position joint="left_jaw" kp="480" kv="3" forcerange="-9 9"/>
-      <position joint="right_jaw" kp="480" kv="3" forcerange="-9 9"/>
+      <position tendon="jaw_opening" kp="${jawGain}" kv="1.5" forcerange="-${gripForce} ${gripForce}"/>
       ${loading ? '<position joint="latch_slide" kp="260" kv="2" forcerange="-7 0"/>' : ""}
     </actuator>
     <sensor>
@@ -405,7 +433,7 @@ const parkedDebris = [0, 0.3, -0.25];
 export class Simulation {
   readonly model;
   readonly data;
-  private readonly target = [0, -0.09, 0.155, 0, 0.046, 0.046, 0, 0];
+  private readonly target = [0, -0.09, 0.155, 0, openTarget, 0, 0];
   private readonly fingers: number[];
   private readonly piece: number;
   private readonly tool: number;
@@ -507,8 +535,9 @@ export class Simulation {
     }
     for (let i = 0; i < 3; i++) this.target[i] += this.bias[i];
     const initial = armTargets(this.target).positions;
-    this.data.qpos.set(initial);
     this.data.ctrl.set(initial);
+    this.data.qpos.set(initial.slice(0, armJoints));
+    this.data.qpos.fill(initial[gripMotor] / 2, armJoints, robotJoints);
     this.advance(120);
     const { subtree_com: com, xpos, xmat } = this.data;
     const [p, m] = [this.tool * 3, this.tool * 9];
@@ -597,7 +626,7 @@ export class Simulation {
       this.unlatched = false;
       this.openedDuringRelease = false;
     }
-    ctrl[motorCount] = this.unlatched ? -machine.latchTravel : 0;
+    ctrl[latchMotor] = this.unlatched ? -machine.latchTravel : 0;
     const p = this.piece * 3;
     if (!this.cell && this.stageTicks < 125) {
       const settledOnEdge =
@@ -613,7 +642,7 @@ export class Simulation {
 
   private pieceStill() {
     const v = this.data.qvel;
-    const start = motorCount;
+    const start = robotJoints;
     return (
       Math.hypot(v[start], v[start + 1], v[start + 2]) < 0.009 &&
       Math.hypot(v[start + 3], v[start + 4], v[start + 5]) < 0.2
@@ -701,7 +730,7 @@ export class Simulation {
     const end = [...this.target];
     const translation = end.slice(0, 3).map((value, index) => value - start[index]);
     const distance = Math.hypot(...translation);
-    const rotationSeconds = Math.max(...[3, 6, 7].map((i) => Math.abs(end[i] - start[i]))) / (45 * radians);
+    const rotationSeconds = Math.max(...[3, 5, 6].map((i) => Math.abs(end[i] - start[i]))) / (45 * radians);
     const stepSeconds = 0.02;
     const steps = Math.max(
       1,
@@ -754,18 +783,16 @@ export class Simulation {
     this.guardReading = undefined;
     if (command.type === "grip") {
       this.released = command.state === "open";
-      const offset = this.layout.calibration ? (seededUnit(this.layout.seed, 143) - 0.5) * 0.001 : 0;
-      const open = command.width_mm === undefined ? 0.046 : (command.width_mm / 1000 + 0.008) / 2;
-      // Closing drives past the jaws' travel limit, so the gripper squeezes with a set force at any width.
-      this.target[4] = this.released ? open : closedTarget + offset;
-      this.target[5] = this.released ? open : closedTarget - offset;
+      const open = command.width_mm === undefined ? openTarget : command.width_mm / 1000 + fingerThickness;
+      // Closing stalls the drive at its force limit, so the gripper squeezes equally hard at any width.
+      this.target[4] = this.released ? open : closedTarget;
     } else {
       this.target[0] = command.x_mm / 1000 + this.bias[0];
       this.target[1] = command.y_mm / 1000 + this.bias[1];
       this.target[2] = command.z_mm / 1000 + this.bias[2];
       this.target[3] += angleDelta(command.yaw_deg * radians, this.target[3]);
-      this.target[6] = (command.pitch_deg ?? 0) * radians;
-      this.target[7] = (command.roll_deg ?? 0) * radians;
+      this.target[5] = (command.pitch_deg ?? 0) * radians;
+      this.target[6] = (command.roll_deg ?? 0) * radians;
     }
     this.tracking = true;
     this.stableTicks = 0;
@@ -801,7 +828,7 @@ export class Simulation {
     this.stopReason = guardStop === "protective_stop" ? "protective_stop" : "grip_complete";
     if (command.type === "move_to") {
       const [x, y, z] = this.toolPose();
-      const desired = rotation(this.target[3], this.target[6], this.target[7]);
+      const desired = rotation(this.target[3], this.target[5], this.target[6]);
       const actual = this.data.xmat;
       const trace = desired.reduce((dot, entry, i) => dot + entry * actual[this.tool * 9 + i], 0);
       const solution = armTargets(this.target, this.data.ctrl);
@@ -888,7 +915,7 @@ export class Simulation {
       z: round(values[2], scale),
     });
     const effort = this.data.actuator_force;
-    const jawWidth = q[armJoints] + q[armJoints + 1];
+    const opening = q[armJoints] + q[armJoints + 1];
     return {
       tick: this.tick,
       moves_remaining: this.moveBudget - (this.cell ? this.cell.moves : this.moves),
@@ -898,13 +925,13 @@ export class Simulation {
       yaw_deg: Math.round(yaw / radians),
       pitch_deg: Math.round(pitch / radians),
       roll_deg: Math.round(roll / radians),
-      jaw_width_mm: Math.round((jawWidth - 0.008) * 1000),
+      jaw_width_mm: Math.round((opening - fingerThickness) * 1000),
       wrist_force_n: vector(wrench.force, 100),
       wrist_torque_nm: vector(wrench.torque, 1000),
       gripper: {
-        // A single-actuator gripper reports one motor effort and whether the jaws stalled on an object.
-        effort_n: round((Math.abs(effort[armJoints]) + Math.abs(effort[armJoints + 1])) / 2, 10),
-        object_detected: !this.released && jawWidth > 2 * jawTravel.min + 0.001,
+        // The gripper's one drive reports its effort as force per jaw, and whether it stalled short of fully closed.
+        effort_n: round(Math.abs(effort[gripMotor]), 10),
+        object_detected: !this.released && opening > 2 * jawTravel.min + 0.001,
       },
       controller: {
         stop_reason: this.stopReason,
